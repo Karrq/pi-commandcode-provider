@@ -36,7 +36,10 @@
  * are sent to the pi-jev classifier provider `local-jev`; a near-0.5 result
  * (low confidence) asks the user, and with no terminal arms instead. That
  * prompt can turn zone checks off for the rest of the session, for when the
- * classifier is unreachable and every command would otherwise ask. A ZDR
+ * classifier is unreachable and every command would otherwise ask. Every consult
+ * is also written as a data-only `commandcode-zdr.jev` entry (command, cwd,
+ * zones, probability, verdict), following the model router's decision entries;
+ * `zonesJevRecord` turns that off. A ZDR
  * rejection while armed never falls back: resolveRejection refuses.
  *
  * The provider rejects with HTTP 422 `cmd_zdr_no_providers` when no upstream
@@ -87,6 +90,8 @@ const ARMED_ENV = "COMMANDCODE_ZDR_ARMED"
 const JEV_PROVIDER = "local-jev"
 const JEV_CACHE_TTL_MS = 60_000
 const DEFAULT_JEV_MIN_CONFIDENCE = 0.6
+/** Session entry recording one Jev consult about a shell command. Data-only. */
+const ZDR_JEV_ENTRY = "commandcode-zdr.jev"
 
 /** Tool input field that carries a path, for the tools that read one directly. */
 const READ_TOOL_PATH: Record<string, string> = {
@@ -107,6 +112,23 @@ type Policy = "ask" | "fallback" | "block"
 /** Which file the settings editor writes. */
 type ZdrScope = "global" | "project"
 
+/** How a Jev consult ended. */
+type JevVerdict = "armed" | "skipped" | "blocked" | "guard-off"
+
+/** Where a recorded probability came from. */
+type JevSource = "classifier" | "cache" | "none"
+
+/** One Jev consult about a shell command, as written to the session. */
+interface JevRecord {
+  command: string
+  verdict: JevVerdict
+  source: JevSource
+  probability?: number
+  confidence?: number
+  detail?: string
+  elapsedMs?: number
+}
+
 interface ZdrConfig {
   enabled: boolean
   exclusions: string[]
@@ -125,6 +147,8 @@ interface ZdrConfig {
   zonesJev: boolean
   /** Below this confidence, a Jev answer is treated as unsure and asks the user. */
   zonesJevMinConfidence: number
+  /** Append a data-only session entry for every Jev consult. */
+  zonesJevRecord: boolean
 }
 
 /** A config file as written: every field optional so scopes can merge. */
@@ -136,6 +160,7 @@ interface ZdrConfigFile {
   zones?: string[]
   zonesJev?: boolean
   zonesJevMinConfidence?: number
+  zonesJevRecord?: boolean
 }
 
 const POLICIES: Policy[] = ["ask", "fallback", "block"]
@@ -148,6 +173,7 @@ const DEFAULT_CONFIG: ZdrConfig = {
   zones: [],
   zonesJev: true,
   zonesJevMinConfidence: DEFAULT_JEV_MIN_CONFIDENCE,
+  zonesJevRecord: true,
 }
 
 function isPolicy(value: unknown): value is Policy {
@@ -178,6 +204,7 @@ function parseConfigObject(value: unknown): ZdrConfigFile | null {
     candidate.zonesJevMinConfidence <= 1
   )
     file.zonesJevMinConfidence = candidate.zonesJevMinConfidence
+  if (typeof candidate.zonesJevRecord === "boolean") file.zonesJevRecord = candidate.zonesJevRecord
   return file
 }
 
@@ -260,6 +287,8 @@ function mergeConfigFiles(
       project?.zonesJevMinConfidence ??
       global?.zonesJevMinConfidence ??
       DEFAULT_CONFIG.zonesJevMinConfidence,
+    zonesJevRecord:
+      project?.zonesJevRecord ?? global?.zonesJevRecord ?? DEFAULT_CONFIG.zonesJevRecord,
   }
 }
 
@@ -544,6 +573,31 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
   })
 
   /**
+   * Write one Jev consult to the session, mirroring the model router's decision
+   * entries. A data-only custom entry is never sent to the model, so this costs
+   * no context and the decision can be read back from the session file later.
+   */
+  function recordJev(ctx: ExtensionContext, record: JevRecord): void {
+    if (config?.zonesJevRecord === false) return
+    try {
+      pi.appendEntry(ZDR_JEV_ENTRY, {
+        at: new Date().toISOString(),
+        cwd,
+        zones,
+        ...record,
+        ...(record.probability !== undefined
+          ? { probability: Math.round(record.probability * 1000) / 1000 }
+          : {}),
+        ...(record.confidence !== undefined
+          ? { confidence: Math.round(record.confidence * 1000) / 1000 }
+          : {}),
+      })
+    } catch {
+      // Recording is a convenience; never let it fail a command.
+    }
+  }
+
+  /**
    * Ask the local pi-jev classifier (`local-jev`) about a shell command the
    * textual match missed. Returns a block result only when the user refuses.
    */
@@ -553,14 +607,26 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
   ): Promise<{ block?: boolean; reason?: string } | undefined> {
     if (config?.zonesJev === false) return
     if (zoneGuardOff || armed) return
+    const started = Date.now()
     const models = ctx.modelRegistry.getModelsOfType("classifier", JEV_PROVIDER)
-    if (models.length === 0) return
+    if (models.length === 0) {
+      recordJev(ctx, {
+        command,
+        source: "none",
+        verdict: "skipped",
+        detail: `No ${JEV_PROVIDER} classifier is registered.`,
+        elapsedMs: Date.now() - started,
+      })
+      return
+    }
 
     const min = config?.zonesJevMinConfidence ?? DEFAULT_JEV_MIN_CONFIDENCE
     const cached = jevCache.get(command)
     let probability: number | undefined
+    let source: JevSource = "classifier"
     if (cached && Date.now() - cached.at < JEV_CACHE_TTL_MS) {
       probability = cached.probability
+      source = "cache"
     } else {
       try {
         const result = await ctx.modelRegistry.classify(models[0], {
@@ -581,19 +647,39 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
         if (answer?.type === "bool") {
           probability = answer.probability
           jevCache.set(command, { at: Date.now(), probability })
+        } else {
+          source = "none"
         }
       } catch {
         probability = undefined
+        source = "none"
       }
     }
 
+    const confidence = probability === undefined ? undefined : Math.abs(probability - 0.5) * 2
     if (probability !== undefined) {
       if (probability >= 0.5) {
         arm(ctx, "jev", command)
+        recordJev(ctx, {
+          command,
+          source,
+          verdict: "armed",
+          probability,
+          elapsedMs: Date.now() - started,
+        })
         return
       }
-      const confidence = Math.abs(probability - 0.5) * 2
-      if (confidence >= min) return
+      if ((confidence ?? 0) >= min) {
+        recordJev(ctx, {
+          command,
+          source,
+          verdict: "skipped",
+          probability,
+          confidence,
+          elapsedMs: Date.now() - started,
+        })
+        return
+      }
     }
 
     const detail =
@@ -609,6 +695,15 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
         `ZDR: ${detail} There is no terminal to ask in, so enforcement is armed.`,
         "warning",
       )
+      recordJev(ctx, {
+        command,
+        source,
+        verdict: "armed",
+        probability,
+        confidence,
+        detail: `${detail} No terminal to ask in.`,
+        elapsedMs: Date.now() - started,
+      })
       return
     }
 
@@ -621,17 +716,29 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
         "Block the command",
       ],
     )
+    const record = {
+      command,
+      source,
+      probability,
+      confidence,
+      detail,
+      elapsedMs: Date.now() - started,
+    }
     if (choice === "Arm ZDR for this session (recommended)") {
       arm(ctx, "jev", command)
+      recordJev(ctx, { ...record, verdict: "armed" })
       return
     }
     if (choice === "Don't arm for the rest of this session") {
       setZoneGuardOff(ctx, true)
+      recordJev(ctx, { ...record, verdict: "guard-off" })
       return
     }
     if (choice === "Block the command") {
+      recordJev(ctx, { ...record, verdict: "blocked" })
       return { block: true, reason: `ZDR: refused at the prompt.\n${command}` }
     }
+    recordJev(ctx, { ...record, verdict: "skipped" })
     return
   }
 
@@ -732,6 +839,14 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
             values: ["on", "off"],
           },
           {
+            id: "zonesJevRecord",
+            label: "Record Jev decisions",
+            description:
+              "on: append a commandcode-zdr.jev session entry per command with the classifier probability and the verdict. Data-only, never sent to the model.",
+            currentValue: current.zonesJevRecord ? "on" : "off",
+            values: ["on", "off"],
+          },
+          {
             id: "armed",
             label: "Zone enforcement",
             description: armed
@@ -806,6 +921,10 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
             }
             if (id === "zoneGuard") {
               setZoneGuardOff(ctx, newValue === "off")
+              return
+            }
+            if (id === "zonesJevRecord") {
+              apply({ ...current, zonesJevRecord: newValue === "on" })
               return
             }
             if (id === "enabled") {
