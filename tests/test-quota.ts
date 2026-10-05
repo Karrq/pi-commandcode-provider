@@ -93,8 +93,8 @@ describe("Command Code quota", () => {
       { window: "weekly", used: 0, cap: 35, resetAt: null },
     ]
     const lines = formatWindowLimits(limits)
-    assert.match(lines[0] ?? "", /^5-hour: 7\.00 \/ 14\.00 credits \(50% used\) \(resets/)
-    assert.match(lines[1] ?? "", /^Weekly: 0\.00 \/ 35\.00 credits \(0% used\)/)
+    assert.match(lines[0] ?? "", /^5h \[[█░]+\] +50% \(resets soon\)$/)
+    assert.match(lines[1] ?? "", /^7d \[[█░]+\] +100%$/)
   })
 
   it("uses the injected clock for the reset countdown", () => {
@@ -336,19 +336,20 @@ describe("Command Code quota", () => {
 
     const output = formatQuota(quota, () => Date.parse("2026-01-15T00:00:00Z"))
     assert.doesNotMatch(output, /Command Code quota —/)
-    assert.match(output, /Credits/)
-    assert.match(output, /Remaining: \$55\.00 of \$67\.34/)
+    assert.match(output, /Credits \[[█░]+\] +82%\n  Remaining: \$55\.00 of \$67\.34/)
     assert.match(output, /Used: \$12\.34/)
     assert.match(output, /Sources: monthly \$40\.00 \/ purchased \$10\.00 \/ free \$5\.00/)
     assert.match(output, /Plan: pro \(active\) · renews Feb 1 \(17d\)/)
     assert.match(output, /Usage \(billing period\)/)
     assert.match(output, /Cost: \$12\.34/)
     assert.match(output, /Requests: 1,500/)
-    assert.match(output, /Account/)
-    assert.match(output, /alice-inc/)
-    assert.match(output, /5-hour: 8\.00 \/ 16\.00 credits/)
-    assert.match(output, /Weekly: 20\.00 \/ 40\.00 credits/)
+    assert.match(output, /Usage windows \(remaining\)/)
+    assert.match(output, /5h \[[█░]+\] +50%/)
+    assert.match(output, /7d \[[█░]+\] +50%/)
     assert.match(output, /https:\/\/commandcode\.ai\/usage/)
+    // The account identity is intentionally not part of the report.
+    assert.doesNotMatch(output, /Account/)
+    assert.doesNotMatch(output, /alice-inc/)
   })
 
   it("formats renewal dates in UTC and handles renewal edge cases", () => {

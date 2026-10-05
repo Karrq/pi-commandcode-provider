@@ -5,21 +5,52 @@ import type {
   CommandCodeWindowLimit,
 } from "./quota-types.ts"
 
+/** Cells in the report progress bar. Mirrors the pi-usage report width. */
+export const BAR_WIDTH = 10
+
+const WINDOW_LABELS: Record<CommandCodeWindowLimit["window"], string> = {
+  fiveHour: "5h",
+  weekly: "7d",
+}
+
+/**
+ * Percent of the budget still available, clamped to 0..100.
+ *
+ * A zero or missing cap counts as fully used: the API reports such windows as
+ * unusable, and dividing by zero would render NaN.
+ */
+export function percentRemaining(used: number, cap: number): number {
+  if (!(cap > 0)) return 0
+  return Math.min(100, Math.max(0, Math.round((1 - used / cap) * 100)))
+}
+
+export function windowRemainingPercent(limit: CommandCodeWindowLimit): number {
+  return percentRemaining(limit.used, limit.cap)
+}
+
+/** A `[████░░░░░░]` bar for a 0..100 percentage. Uncolored so callers can style it. */
+export function progressBar(percent: number, width: number = BAR_WIDTH): string {
+  const clamped = Math.min(100, Math.max(0, percent))
+  const filled = Math.round((clamped / 100) * width)
+  return `${"█".repeat(filled)}${"░".repeat(width - filled)}`
+}
+
+/**
+ * One `5h  [████░░░░░░]  50% (resets in 2h 14m)` line per window.
+ *
+ * The percentage is budget remaining, not used, so the bar and the number
+ * always shrink together as the window fills.
+ */
 export function formatWindowLimits(
   limits: readonly CommandCodeWindowLimit[],
   now: () => number = Date.now,
 ): string[] {
-  const labels: Record<CommandCodeWindowLimit["window"], string> = {
-    fiveHour: "5-hour",
-    weekly: "Weekly",
-  }
-
+  const labelWidth = Math.max(0, ...limits.map((limit) => WINDOW_LABELS[limit.window].length))
   return limits.map((limit) => {
-    const used = limit.used.toFixed(2)
-    const cap = limit.cap.toFixed(2)
-    const percent = limit.cap > 0 ? Math.round((limit.used / limit.cap) * 100) : 0
+    const remaining = windowRemainingPercent(limit)
+    const label = WINDOW_LABELS[limit.window].padEnd(labelWidth)
     const reset = limit.resetAt === null ? "" : ` (resets ${formatResetClock(limit.resetAt, now)})`
-    return `${labels[limit.window]}: ${used} / ${cap} credits (${percent}% used)${reset}`
+    return `${label} [${progressBar(remaining)}] ${String(remaining).padStart(3)}%${reset}`
   })
 }
 
@@ -101,10 +132,11 @@ export function formatQuota(quota: CommandCodeQuota, now: () => number = Date.no
   const pool = remaining + spent
 
   if (quota.credits || quota.summary) {
-    lines.push("Credits")
+    const left = percentRemaining(spent, pool)
+    const bar = pool > 0 ? ` [${progressBar(left)}] ${String(left).padStart(3)}%` : ""
+    lines.push(`Credits${bar}`)
     lines.push(`  Remaining: $${remaining.toFixed(2)} of $${pool.toFixed(2)}`)
     lines.push(`  Used: $${spent.toFixed(2)}`)
-    lines.push(`  ${pool > 0 ? Math.round((spent / pool) * 100) : 0}% used`)
   }
 
   const detail = creditsDetail(quota.credits)
@@ -121,14 +153,10 @@ export function formatQuota(quota: CommandCodeQuota, now: () => number = Date.no
     }
   }
 
-  lines.push("")
-  lines.push("Account")
-  lines.push(`  ${quota.account.keyName ?? quota.account.login}`)
-
   const limits = quota.credits?.windowLimits ?? []
   if (limits.length > 0) {
     lines.push("")
-    lines.push("Usage windows:")
+    lines.push("Usage windows (remaining)")
     lines.push(...formatWindowLimits(limits, now).map((line) => `  ${line}`))
   }
 

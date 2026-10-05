@@ -7,7 +7,7 @@
  * without a runtime or a theme.
  */
 
-import { formatResetClock } from "./quota-format.ts"
+import { formatResetClock, windowRemainingPercent } from "./quota-format.ts"
 import type { CommandCodeQuota, CommandCodeWindowLimit } from "./quota-types.ts"
 
 export interface UsageSettings {
@@ -51,10 +51,7 @@ const WINDOW_LABELS: Record<CommandCodeWindowLimit["window"], string> = {
 /** Filled cells in the mini bar. */
 const BAR_WIDTH = 5
 
-export function remainingPercent(limit: CommandCodeWindowLimit): number {
-  if (!(limit.cap > 0)) return 0
-  return Math.min(100, Math.max(0, Math.round((1 - limit.used / limit.cap) * 100)))
-}
+export const remainingPercent = windowRemainingPercent
 
 function severity(remaining: number): UsageColor {
   if (remaining >= 50) return "success"
@@ -63,17 +60,19 @@ function severity(remaining: number): UsageColor {
 }
 
 function renderWindow(limit: CommandCodeWindowLimit, now: number, color: Colorize): string {
-  const remaining = remainingPercent(limit)
+  const remaining = windowRemainingPercent(limit)
   const filled = Math.round((remaining / 100) * BAR_WIDTH)
-  const bar = `${"█".repeat(filled)}${"░".repeat(BAR_WIDTH - filled)}`
   const tone = severity(remaining)
+  // Filled cells carry the severity color, empty cells stay dim, matching the
+  // pi-synthetic quota bar.
+  const bar = `${color(tone, "█".repeat(filled))}${color("dim", "░".repeat(BAR_WIDTH - filled))}`
 
   const reset =
     limit.resetAt === null
       ? ""
       : color("dim", ` ${formatResetClock(limit.resetAt, () => now).replace(/^in /, "↻")}`)
 
-  return `${color("muted", WINDOW_LABELS[limit.window])} ${color(tone, bar)} ${color(tone, `${remaining}%`)}${reset}`
+  return `${color("muted", WINDOW_LABELS[limit.window])} ${bar} ${color(tone, `${remaining}%`)}${reset}`
 }
 
 /**
