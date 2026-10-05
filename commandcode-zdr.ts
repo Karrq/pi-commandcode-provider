@@ -11,10 +11,11 @@
  * that other extensions drive directly and that never run pi's
  * `before_provider_headers` hook, so those honor the same policy.
  *
- * Settings can be global or project-local:
- *   - global:  <agent-dir>/commandcode-zdr.json
- *   - project: <cwd>/.pi/commandcode-zdr.json, read only when the project is
- *     trusted, and overriding the global file field by field
+ * Settings live under the `commandcode-zdr` key of pi's settings.json, the
+ * same place pi reads its own configuration:
+ *   - global:  <agent-dir>/settings.json
+ *   - project: <cwd>/.pi/settings.json, read only when the project is trusted,
+ *     and overriding the global namespace field by field
  *
  * Three settings:
  *   - enforcement: on / off
@@ -51,7 +52,10 @@ import { Container, type SettingItem, SettingsList } from "@earendil-works/pi-tu
 import { setCommandCodeZdrDecider } from "./src/zdr-state.ts"
 
 const PROVIDER = "commandcode"
-const CONFIG_FILE = "commandcode-zdr.json"
+/** Namespace inside settings.json: `"commandcode-zdr": { ... }`. */
+const SETTINGS_KEY = "commandcode-zdr"
+/** Pre-settings.json config location, read once to migrate an existing config. */
+const LEGACY_CONFIG_FILE = "commandcode-zdr.json"
 const CACHE_PATH = join(getAgentDir(), "commandcode-models.json")
 
 const ZDR_REJECTION = /cmd_zdr_no_providers|no zero-data-retention upstream/i
@@ -106,16 +110,10 @@ function stringList(value: unknown): string[] {
     : []
 }
 
-/** Only present, valid fields are kept so a project file can override a subset. */
-function parseConfigFile(raw: string): ZdrConfigFile | null {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    return null
-  }
-  if (typeof parsed !== "object" || parsed === null) return null
-  const candidate = parsed as Partial<ZdrConfigFile>
+/** Only present, valid fields are kept so a project scope can override a subset. */
+function parseConfigObject(value: unknown): ZdrConfigFile | null {
+  if (typeof value !== "object" || value === null) return null
+  const candidate = value as Partial<ZdrConfigFile>
   const file: ZdrConfigFile = {}
   if (typeof candidate.enabled === "boolean") file.enabled = candidate.enabled
   if (isPolicy(candidate.onUnsupported)) file.onUnsupported = candidate.onUnsupported
@@ -124,18 +122,63 @@ function parseConfigFile(raw: string): ZdrConfigFile | null {
   return file
 }
 
-function globalConfigPath(): string {
-  return join(getAgentDir(), CONFIG_FILE)
+/** Global scope is pi's agent-directory settings.json. */
+function globalSettingsPath(): string {
+  return join(getAgentDir(), "settings.json")
 }
 
-function projectConfigPath(cwd: string): string {
-  return join(cwd, ".pi", CONFIG_FILE)
+/** Project scope is pi's working-directory .pi/settings.json. */
+function projectSettingsPath(cwd: string): string {
+  return join(cwd, ".pi", "settings.json")
 }
 
-function readConfigFile(path: string): ZdrConfigFile | null {
+function readSettingsObject(path: string): Record<string, unknown> | null {
   if (!existsSync(path)) return null
   try {
-    return parseConfigFile(readFileSync(path, "utf8"))
+    const raw = readFileSync(path, "utf8").replace(/^\uFEFF/, "")
+    const parsed = JSON.parse(raw)
+    return typeof parsed === "object" && parsed !== null
+      ? (parsed as Record<string, unknown>)
+      : null
+  } catch {
+    return null
+  }
+}
+
+/** Read the `commandcode-zdr` namespace from a settings.json, if present. */
+function readNamespaced(path: string): ZdrConfigFile | null {
+  const settings = readSettingsObject(path)
+  if (!settings) return null
+  return parseConfigObject(settings[SETTINGS_KEY])
+}
+
+/**
+ * Write the namespace back into a settings.json, preserving every other key pi
+ * stores there. pi's own writer spreads the current file before applying its
+ * changes, so the namespace survives later pi settings writes too. Returns
+ * false instead of overwriting a settings file that exists but cannot be
+ * parsed, which would discard pi's configuration.
+ */
+function writeNamespaced(path: string, config: ZdrConfig): boolean {
+  const existing = readSettingsObject(path)
+  if (existing === null && existsSync(path)) return false
+  const settings = existing ?? {}
+  settings[SETTINGS_KEY] = config
+  try {
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`, "utf8")
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Pre-settings.json location, read once to migrate an existing config. */
+function readLegacyConfig(): ZdrConfigFile | null {
+  const path = join(getAgentDir(), LEGACY_CONFIG_FILE)
+  if (!existsSync(path)) return null
+  try {
+    return parseConfigObject(JSON.parse(readFileSync(path, "utf8")))
   } catch {
     return null
   }
@@ -155,7 +198,7 @@ function mergeConfigFiles(
 }
 
 export default function commandCodeZdr(pi: ExtensionAPI) {
-  /** Effective config for the current session; null until a config file exists. */
+  /** Effective config for the current session; null until settings carry the namespace. */
   let config: ZdrConfig | null = null
   /** Hydrated from the effective config so learned rejections survive a restart. */
   const rejected = new Set<string>()
@@ -166,42 +209,47 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
   /** Project root for project-scoped reads and writes. */
   let cwd = process.cwd()
   let projectTrusted = false
-  /** Where the editor writes; defaults to the project file when one exists. */
+  /** Where the editor writes; defaults to the project scope when it is set. */
   let scope: ZdrScope = "global"
 
   /**
    * Resolve the effective config for a session.
    *
-   * The project file only participates when the project is trusted, the same
-   * gate pi applies to project settings. A project field overrides the global
-   * one; learned rejections are the union of both.
+   * Both scopes come from settings.json: the agent-directory file and the
+   * working directory's .pi file. The project scope only participates when the
+   * project is trusted, the same gate pi applies. A project field overrides the
+   * global one; learned rejections are the union of both.
    */
   function resolveConfig(ctx: ExtensionContext): void {
     cwd = ctx.cwd
     projectTrusted = ctx.isProjectTrusted()
-    const global = readConfigFile(globalConfigPath())
-    const project = projectTrusted ? readConfigFile(projectConfigPath(cwd)) : null
+    let global = readNamespaced(globalSettingsPath())
+    const project = projectTrusted ? readNamespaced(projectSettingsPath(cwd)) : null
+    // One-time move of the old dedicated file, so existing settings are not lost.
+    if (!global) {
+      const legacy = readLegacyConfig()
+      const migrated = legacy ? mergeConfigFiles(legacy, null) : null
+      if (migrated && writeNamespaced(globalSettingsPath(), migrated)) global = legacy
+    }
     config = mergeConfigFiles(global, project)
     rejected.clear()
     for (const modelId of config?.rejected ?? []) rejected.add(modelId)
     scope = project ? "project" : "global"
     // The provider transport is the only path every request takes, including
     // worker agent loops that never run pi's header hook. Publish the decision
-    // there. A missing config file leaves it to the CMD_ZDR environment.
+    // there. A missing namespace leaves it to the CMD_ZDR environment.
     setCommandCodeZdrDecider(config ? (modelId) => sendZdrFor(modelId) : undefined)
   }
 
   function scopePath(target: ZdrScope): string {
-    return target === "project" ? projectConfigPath(cwd) : globalConfigPath()
+    return target === "project" ? projectSettingsPath(cwd) : globalSettingsPath()
   }
 
   function saveConfig(next: ZdrConfig, target: ZdrScope = scope): void {
     // The in-memory set is the source of truth for rejections, so a settings
     // edit mid-session cannot write back a stale copy.
     const merged: ZdrConfig = { ...next, rejected: [...rejected] }
-    const path = scopePath(target)
-    mkdirSync(dirname(path), { recursive: true })
-    writeFileSync(path, `${JSON.stringify(merged, null, 2)}\n`, "utf8")
+    writeNamespaced(scopePath(target), merged)
     config = merged
   }
 
@@ -345,7 +393,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
           id: "scope",
           label: "Save settings to",
           description: projectTrusted
-            ? "global: every project. project: this repo only, in .pi/commandcode-zdr.json. Switching writes the current values to that scope."
+            ? "global: every project. project: this repo only, in .pi/settings.json. Switching writes the current values to that scope."
             : "global: every project. Project scope is unavailable until this project is trusted.",
           currentValue: scope === "project" ? "project" : "global",
           values: projectTrusted ? ["global", "project"] : ["global"],
