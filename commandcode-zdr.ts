@@ -21,6 +21,19 @@
  *   - enforcement: on / off
  *   - exclusions:  model ids that never receive the header
  *   - on 422:      ask / fallback / block
+ * plus `zones` and its Jev settings; see below.
+ *
+ * ZDR zones: a zone is a folder whose content must never reach a model
+ * without zero-data-retention. When a tool touches one, the session becomes
+ * "armed": every later request carries x-cmd-zdr: 1 no matter what enabled,
+ * exclusions, or rejected say (armed wins). Arming is written as a
+ * `commandcode-zdr.armed` session entry and recomputed from the current
+ * branch, so navigating to a branch that never touched a zone disarms.
+ * `COMMANDCODE_ZDR_ARMED` is mirrored in the environment while armed so
+ * spawned subagents inherit it. Shell commands the textual path check misses
+ * are sent to the pi-jev classifier provider `local-jev`; a near-0.5 result
+ * (low confidence) asks the user, and with no terminal arms instead. A ZDR
+ * rejection while armed never falls back: resolveRejection refuses.
  *
  * The provider rejects with HTTP 422 `cmd_zdr_no_providers` when no upstream
  * honours zero data retention for the requested model.
@@ -50,6 +63,15 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent"
 import { Container, type SettingItem, SettingsList } from "@earendil-works/pi-tui"
 import { setCommandCodeZdrDecider } from "./src/zdr-state.ts"
+import {
+  ZDR_ARMED_ENTRY,
+  type ArmedMarker,
+  armedFromEntries,
+  commandMentionsZone,
+  formatZoneList,
+  normalizeZone,
+  pathInZones,
+} from "./src/zdr-zones.ts"
 
 const PROVIDER = "commandcode"
 /** Namespace inside settings.json: `"commandcode-zdr": { ... }`. */
@@ -57,6 +79,18 @@ const SETTINGS_KEY = "commandcode-zdr"
 /** Pre-settings.json config location, read once to migrate an existing config. */
 const LEGACY_CONFIG_FILE = "commandcode-zdr.json"
 const CACHE_PATH = join(getAgentDir(), "commandcode-models.json")
+const ARMED_ENV = "COMMANDCODE_ZDR_ARMED"
+const JEV_PROVIDER = "local-jev"
+const JEV_CACHE_TTL_MS = 60_000
+const DEFAULT_JEV_MIN_CONFIDENCE = 0.6
+
+/** Tool input field that carries a path, for the tools that read one directly. */
+const READ_TOOL_PATH: Record<string, string> = {
+  read: "path",
+  grep: "path",
+  find: "path",
+  ls: "path",
+}
 
 const ZDR_REJECTION = /cmd_zdr_no_providers|no zero-data-retention upstream/i
 const EMPTY_RESPONSE = /empty response/i
@@ -81,6 +115,12 @@ interface ZdrConfig {
    * silently downgrade the next request.
    */
   rejected: string[]
+  /** Folders whose content must never reach a model without ZDR. */
+  zones: string[]
+  /** Whether to consult the local Jev classifier about shell commands. */
+  zonesJev: boolean
+  /** Below this confidence, a Jev answer is treated as unsure and asks the user. */
+  zonesJevMinConfidence: number
 }
 
 /** A config file as written: every field optional so scopes can merge. */
@@ -89,6 +129,9 @@ interface ZdrConfigFile {
   exclusions?: string[]
   onUnsupported?: Policy
   rejected?: string[]
+  zones?: string[]
+  zonesJev?: boolean
+  zonesJevMinConfidence?: number
 }
 
 const POLICIES: Policy[] = ["ask", "fallback", "block"]
@@ -98,6 +141,9 @@ const DEFAULT_CONFIG: ZdrConfig = {
   exclusions: [],
   onUnsupported: "ask",
   rejected: [],
+  zones: [],
+  zonesJev: true,
+  zonesJevMinConfidence: DEFAULT_JEV_MIN_CONFIDENCE,
 }
 
 function isPolicy(value: unknown): value is Policy {
@@ -119,6 +165,15 @@ function parseConfigObject(value: unknown): ZdrConfigFile | null {
   if (isPolicy(candidate.onUnsupported)) file.onUnsupported = candidate.onUnsupported
   if (candidate.exclusions !== undefined) file.exclusions = stringList(candidate.exclusions)
   if (candidate.rejected !== undefined) file.rejected = stringList(candidate.rejected)
+  if (candidate.zones !== undefined) file.zones = stringList(candidate.zones)
+  if (typeof candidate.zonesJev === "boolean") file.zonesJev = candidate.zonesJev
+  if (
+    typeof candidate.zonesJevMinConfidence === "number" &&
+    Number.isFinite(candidate.zonesJevMinConfidence) &&
+    candidate.zonesJevMinConfidence >= 0 &&
+    candidate.zonesJevMinConfidence <= 1
+  )
+    file.zonesJevMinConfidence = candidate.zonesJevMinConfidence
   return file
 }
 
@@ -194,6 +249,13 @@ function mergeConfigFiles(
     exclusions: project?.exclusions ?? global?.exclusions ?? [],
     onUnsupported: project?.onUnsupported ?? global?.onUnsupported ?? DEFAULT_CONFIG.onUnsupported,
     rejected: [...new Set([...(global?.rejected ?? []), ...(project?.rejected ?? [])])],
+    // Safety is additive, unlike exclusions: a zone in either scope is a zone.
+    zones: [...new Set([...(global?.zones ?? []), ...(project?.zones ?? [])])],
+    zonesJev: project?.zonesJev ?? global?.zonesJev ?? DEFAULT_CONFIG.zonesJev,
+    zonesJevMinConfidence:
+      project?.zonesJevMinConfidence ??
+      global?.zonesJevMinConfidence ??
+      DEFAULT_CONFIG.zonesJevMinConfidence,
   }
 }
 
@@ -211,6 +273,14 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
   let projectTrusted = false
   /** Where the editor writes; defaults to the project scope when it is set. */
   let scope: ZdrScope = "global"
+  /** True once a tool has touched a zone; requests then require ZDR unconditionally. */
+  let armed = false
+  /** Why the session is armed, for the editor status row. */
+  let armedSource: string | undefined
+  /** Normalized zones for the current cwd. */
+  let zones: string[] = []
+  /** Recent Jev answers, keyed by command, so repeated calls do not re-classify. */
+  const jevCache = new Map<string, { at: number; probability: number }>()
 
   /**
    * Resolve the effective config for a session.
@@ -234,11 +304,21 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     config = mergeConfigFiles(global, project)
     rejected.clear()
     for (const modelId of config?.rejected ?? []) rejected.add(modelId)
+    zones = (config?.zones ?? [])
+      .map((zone) => normalizeZone(zone, cwd))
+      .filter((zone): zone is string => zone !== undefined)
     scope = project ? "project" : "global"
-    // The provider transport is the only path every request takes, including
-    // worker agent loops that never run pi's header hook. Publish the decision
-    // there. A missing namespace leaves it to the CMD_ZDR environment.
-    setCommandCodeZdrDecider(config ? (modelId) => sendZdrFor(modelId) : undefined)
+    publishDecider()
+  }
+
+  /**
+   * Publish the header decision to the provider transport, the only path every
+   * request takes (including worker agent loops that never run pi's header
+   * hook). A missing namespace and no arming leaves it to the CMD_ZDR
+   * environment. Arming keeps a decider alive even without saved settings.
+   */
+  function publishDecider(): void {
+    setCommandCodeZdrDecider(config || armed ? (modelId) => sendZdrFor(modelId) : undefined)
   }
 
   function scopePath(target: ZdrScope): string {
@@ -272,12 +352,64 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
 
   /** Whether the next request for this model carries the header. Consumes a one-shot release. */
   function sendZdrFor(modelId: string): boolean {
+    // Armed wins over enabled, exclusions, rejected, sessionAllow, and onceAllow.
+    if (armed) return true
     if (!config || !config.enabled) return false
     if (onceAllow.delete(modelId)) return false
     if (config.exclusions.includes(modelId)) return false
     if (sessionAllow.has(modelId)) return false
     if (rejected.has(modelId)) return false
     return true
+  }
+
+  /** Persist arming on the branch, mirror it into the environment, and notify once. */
+  function arm(ctx: ExtensionContext, source: string, detail?: string): void {
+    // One marker per branch is enough to arm it; repeated touches only add noise.
+    if (armed) return
+    const marker: ArmedMarker = { at: Date.now(), source, ...(detail ? { detail } : {}) }
+    pi.appendEntry(ZDR_ARMED_ENTRY, marker)
+    process.env[ARMED_ENV] = "1"
+    armed = true
+    armedSource = source
+    publishDecider()
+    ctx.ui.notify(
+      `ZDR armed (${source}${detail ? `: ${detail}` : ""}). Protected data was touched, so requests now require zero data retention.`,
+      "info",
+    )
+  }
+
+  function disarm(): void {
+    armed = false
+    armedSource = undefined
+    delete process.env[ARMED_ENV]
+    publishDecider()
+  }
+
+  /**
+   * Recompute arming from the current branch, the cwd, and the inherited env.
+   * Navigating to a branch that never armed disarms; arming found there (or in
+   * the cwd, or inherited from a parent) is persisted so it survives a reload.
+   */
+  function recomputeArmed(ctx: ExtensionContext): void {
+    const inherited = process.env[ARMED_ENV] === "1"
+    const marker = armedFromEntries(ctx.sessionManager.getBranch() as unknown[])
+    const cwdZone = zones.find((zone) => pathInZones(cwd, [zone], cwd))
+    const fromBranch = marker !== undefined
+    armed = fromBranch || cwdZone !== undefined || inherited
+    armedSource = marker?.source ?? (cwdZone ? "cwd" : inherited ? "inherited" : undefined)
+    if (armed) {
+      process.env[ARMED_ENV] = "1"
+      // Persist cwd/inherited arming on the branch; a marker from a previous run is enough.
+      if (!fromBranch)
+        pi.appendEntry(ZDR_ARMED_ENTRY, {
+          at: Date.now(),
+          source: armedSource ?? "cwd",
+          ...(cwdZone ? { detail: cwdZone } : {}),
+        })
+    } else {
+      delete process.env[ARMED_ENV]
+    }
+    publishDecider()
   }
 
   /**
@@ -290,6 +422,14 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     modelId: string,
   ): Promise<boolean> {
     const reason = `Command Code has no ZDR upstream for ${modelId} (422 cmd_zdr_no_providers).`
+
+    if (armed) {
+      ctx.ui.notify(
+        `${reason} ZDR is armed because protected data was read, and fallback is disabled while armed. Use /commandcode:zdr to turn enforcement off if that data is no longer in context.`,
+        "error",
+      )
+      return false
+    }
 
     if (activeConfig.onUnsupported === "block") {
       ctx.ui.notify(`${reason} Policy is block, so the request stays failed.`, "error")
@@ -328,11 +468,133 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     resolveConfig(ctx)
+    recomputeArmed(ctx)
+  })
+
+  pi.on("session_tree", async (_event, ctx) => {
+    // The branch changed, so arming may have been added or left behind.
+    recomputeArmed(ctx)
+  })
+
+  pi.on("session_before_switch", async () => {
+    disarm()
   })
 
   pi.on("session_shutdown", async () => {
+    disarm()
     setCommandCodeZdrDecider(undefined)
   })
+
+  pi.on("tool_call", async (event, ctx) => {
+    if (zones.length === 0) return
+    const input = (event.input ?? {}) as Record<string, unknown>
+    if (event.toolName === "bash") {
+      const command = typeof input.command === "string" ? input.command : ""
+      if (!command) return
+      const mentioned = commandMentionsZone(command, zones, cwd)
+      if (mentioned) {
+        arm(ctx, "bash", mentioned)
+        return
+      }
+      return consultJev(ctx, command)
+    }
+    const field = READ_TOOL_PATH[event.toolName]
+    if (field) {
+      const value = input[field]
+      if (typeof value === "string" && pathInZones(value, zones, cwd))
+        arm(ctx, event.toolName, value)
+      return
+    }
+    // Any other tool: a string argument naming a zone is enough to arm. Over-arming is safe.
+    for (const value of Object.values(input)) {
+      if (typeof value === "string" && pathInZones(value, zones, cwd)) {
+        arm(ctx, event.toolName, value)
+        return
+      }
+    }
+  })
+
+  /**
+   * Ask the local pi-jev classifier (`local-jev`) about a shell command the
+   * textual match missed. Returns a block result only when the user refuses.
+   */
+  async function consultJev(
+    ctx: ExtensionContext,
+    command: string,
+  ): Promise<{ block?: boolean; reason?: string } | undefined> {
+    if (config?.zonesJev === false) return
+    const models = ctx.modelRegistry.getModelsOfType("classifier", JEV_PROVIDER)
+    if (models.length === 0) return
+
+    const min = config?.zonesJevMinConfidence ?? DEFAULT_JEV_MIN_CONFIDENCE
+    const cached = jevCache.get(command)
+    let probability: number | undefined
+    if (cached && Date.now() - cached.at < JEV_CACHE_TTL_MS) {
+      probability = cached.probability
+    } else {
+      try {
+        const result = await ctx.modelRegistry.classify(models[0], {
+          state: { cwd, command, zones },
+          questions: {
+            reads_zone: {
+              type: "bool",
+              instructions:
+                "Could running this shell command read, print, copy, encode, or transmit the contents of a file inside one of the protected directories? Consider variables, concatenation, quoting, globs, subshells, interpreters, scripts, and symlinks.",
+              criteria: {
+                true: "It could reach protected content",
+                false: "It cannot reach protected content",
+              },
+            },
+          },
+        })
+        const answer = result.answers.reads_zone
+        if (answer?.type === "bool") {
+          probability = answer.probability
+          jevCache.set(command, { at: Date.now(), probability })
+        }
+      } catch {
+        probability = undefined
+      }
+    }
+
+    if (probability !== undefined) {
+      if (probability >= 0.5) {
+        arm(ctx, "jev", command)
+        return
+      }
+      const confidence = Math.abs(probability - 0.5) * 2
+      if (confidence >= min) return
+    }
+
+    const detail =
+      probability === undefined
+        ? "The local Jev classifier was unavailable."
+        : `The local Jev classifier put the chance this reads a zone at ${Math.round(
+            probability * 100,
+          )}%, too close to call.`
+
+    if (ctx.mode !== "tui") {
+      arm(ctx, "jev", command)
+      ctx.ui.notify(
+        `ZDR: ${detail} There is no terminal to ask in, so enforcement is armed.`,
+        "warning",
+      )
+      return
+    }
+
+    const choice = await ctx.ui.select(
+      `This command may read a ZDR zone.\n${command}\n\n${detail}`,
+      ["Arm ZDR for this session (recommended)", "Run it without arming", "Block the command"],
+    )
+    if (choice === "Arm ZDR for this session (recommended)") {
+      arm(ctx, "jev", command)
+      return
+    }
+    if (choice === "Block the command") {
+      return { block: true, reason: `ZDR: refused at the prompt.\n${command}` }
+    }
+    return
+  }
 
   pi.on("message_end", async (event, ctx) => {
     const message = event.message
@@ -402,6 +664,35 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
         const items: SettingItem[] = [
           scopeItem,
           {
+            id: "zones",
+            label: "ZDR zones",
+            description:
+              zones.length > 0
+                ? `Reading inside these folders arms ZDR for the session: ${formatZoneList(
+                    zones,
+                  )}. Edit the commandcode-zdr.zones array in settings.json to change them.`
+                : "None. Add a commandcode-zdr.zones array of folders in settings.json.",
+            currentValue: zones.length > 0 ? String(zones.length) : "none",
+            values: [zones.length > 0 ? String(zones.length) : "none"],
+          },
+          {
+            id: "zonesJev",
+            label: "Zone check via Jev",
+            description:
+              "on: ask the local Jev classifier about commands the path check misses, and ask you when it is unsure. off: path matching only.",
+            currentValue: current.zonesJev ? "on" : "off",
+            values: ["on", "off"],
+          },
+          {
+            id: "armed",
+            label: "Zone enforcement",
+            description: armed
+              ? `Armed by ${armedSource ?? "a zone read"}; requests require zero data retention.`
+              : "Not armed. No ZDR-zone data has been touched this session.",
+            currentValue: armed ? "armed" : "idle",
+            values: [armed ? "armed" : "idle"],
+          },
+          {
             id: "enabled",
             label: "ZDR enforcement",
             description: "on: send x-cmd-zdr: 1 on Command Code requests that are not excluded.",
@@ -459,6 +750,10 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
               scope = newValue
               // Persist the current values into the new scope so it now owns them.
               saveConfig(current, scope)
+              return
+            }
+            if (id === "zonesJev") {
+              apply({ ...current, zonesJev: newValue === "on" })
               return
             }
             if (id === "enabled") {
@@ -527,8 +822,8 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
 
       ctx.ui.notify(
         current.enabled
-          ? `ZDR on for ${scope}, ${current.exclusions.length} model(s) excluded`
-          : `ZDR off for ${scope}`,
+          ? `ZDR on for ${scope}, ${current.exclusions.length} model(s) excluded, ${zones.length} zone(s)`
+          : `ZDR off for ${scope}, ${zones.length} zone(s)`,
         "info",
       )
     },
