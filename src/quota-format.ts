@@ -1,5 +1,4 @@
 import type {
-  CommandCodeCredits,
   CommandCodeQuota,
   CommandCodeSubscription,
   CommandCodeWindowLimit,
@@ -70,16 +69,6 @@ export function formatResetClock(resetAtSeconds: number, now: () => number): str
   return days === 1 ? "in 1 day" : `in ${days} days`
 }
 
-function creditsDetail(credits: CommandCodeCredits | null): string | undefined {
-  if (!credits) return undefined
-  const parts = [
-    `monthly $${credits.monthlyCredits.toFixed(2)}`,
-    `purchased $${credits.purchasedCredits.toFixed(2)}`,
-  ]
-  if (credits.freeCredits > 0) parts.push(`free $${credits.freeCredits.toFixed(2)}`)
-  return `Sources: ${parts.join(" / ")}`
-}
-
 function parsePeriodEnd(value: string): Date | null {
   const trimmed = value.trim()
   const timestamp = /^\d+$/.test(trimmed) ? Number(trimmed) : Date.parse(trimmed)
@@ -131,17 +120,18 @@ export function formatQuota(quota: CommandCodeQuota, now: () => number = Date.no
   const spent = quota.summary?.totalCost ?? 0
   const pool = remaining + spent
 
+  if (quota.subscription) {
+    lines.push(subscriptionLine(quota.subscription, now))
+  }
+
   if (quota.credits || quota.summary) {
+    if (lines.length > 0) lines.push("")
     const left = percentRemaining(spent, pool)
     const bar = pool > 0 ? ` [${progressBar(left)}] ${String(left).padStart(3)}%` : ""
     lines.push(`Credits${bar}`)
     lines.push(`  Remaining: $${remaining.toFixed(2)} of $${pool.toFixed(2)}`)
     lines.push(`  Used: $${spent.toFixed(2)}`)
   }
-
-  const detail = creditsDetail(quota.credits)
-  if (detail) lines.push(detail)
-  if (quota.subscription) lines.push(subscriptionLine(quota.subscription, now))
 
   if (quota.summary) {
     lines.push("")
@@ -165,7 +155,5 @@ export function formatQuota(quota: CommandCodeQuota, now: () => number = Date.no
     lines.push(`Unavailable: ${quota.unavailable?.join(", ")}`)
   }
 
-  lines.push("")
-  lines.push("Full detail: https://commandcode.ai/usage")
   return lines.join("\n")
 }

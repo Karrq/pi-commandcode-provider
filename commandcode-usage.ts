@@ -6,7 +6,7 @@
  * and turn settle, with a short throttle so idle sessions do not hammer the
  * billing endpoints.
  *
- * The snapshot comes from the same alpha endpoints `/commandcode-quota` reads,
+ * The snapshot comes from the same alpha endpoints `/commandcode:quota` reads,
  * through the shared quota layer.
  *
  * Toggle it with `/commandcode:settings`. The setting persists in

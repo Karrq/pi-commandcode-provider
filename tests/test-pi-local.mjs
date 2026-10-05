@@ -484,14 +484,14 @@ async function runRpcExtensionCommands(timeoutMs = 30_000) {
     const commandNames = commandsResponse.data?.commands?.map((command) => command.name) ?? []
 
     // The cached catalog registers immediately and refreshes in the
-    // background. `/commandcode-refresh` coalesces with an in-flight refresh,
+    // background. `/commandcode:refresh` coalesces with an in-flight refresh,
     // so the status must report the startup refresh as finished before the
     // catalog is changed; otherwise the command reports the old catalog.
     let statusBefore
     for (let attempt = 0; attempt < 20; attempt += 1) {
       const id = `status-before-${attempt}`
       const fromIndex = events.length
-      send({ id, type: "prompt", message: "/commandcode-status" })
+      send({ id, type: "prompt", message: "/commandcode:status" })
       await waitFor((event) => event.type === "response" && event.id === id && event.success)
       statusBefore = await waitFor(
         (event) =>
@@ -506,7 +506,7 @@ async function runRpcExtensionCommands(timeoutMs = 30_000) {
     }
 
     includeRefreshedModel = true
-    send({ id: "refresh", type: "prompt", message: "/commandcode-refresh" })
+    send({ id: "refresh", type: "prompt", message: "/commandcode:refresh" })
     await waitFor((event) => event.type === "response" && event.id === "refresh" && event.success)
     const refreshNotification = await waitFor(
       (event) =>
@@ -516,7 +516,7 @@ async function runRpcExtensionCommands(timeoutMs = 30_000) {
         event.message.includes("4 models from live"),
     )
 
-    send({ id: "status-after", type: "prompt", message: "/commandcode-status" })
+    send({ id: "status-after", type: "prompt", message: "/commandcode:status" })
     await waitFor(
       (event) => event.type === "response" && event.id === "status-after" && event.success,
     )
@@ -721,7 +721,7 @@ try {
   )
   assert.doesNotMatch(
     firstOfflineList.stderr,
-    /\[commandcode\]|no valid cached catalog|until \/commandcode-refresh succeeds/,
+    /\[commandcode\]|no valid cached catalog|until \/commandcode:refresh succeeds/,
   )
   assert.throws(() => accessSync(modelsCachePath, constants.R_OK), /ENOENT|no such file/i)
 
@@ -1012,8 +1012,8 @@ try {
   console.log("[pi-local] runtime commands through real RPC extension lifecycle")
   includeRefreshedModel = false
   const runtimeCommands = await runRpcExtensionCommands()
-  assert.ok(runtimeCommands.commandNames.includes("commandcode-refresh"))
-  assert.ok(runtimeCommands.commandNames.includes("commandcode-status"))
+  assert.ok(runtimeCommands.commandNames.includes("commandcode:refresh"))
+  assert.ok(runtimeCommands.commandNames.includes("commandcode:status"))
   assert.match(runtimeCommands.statusBefore, /source: live/)
   assert.match(runtimeCommands.refreshNotification, /4 models from live/)
   assert.match(runtimeCommands.statusAfter, /model count: 4/)

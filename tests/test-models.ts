@@ -416,7 +416,7 @@ describe("loadCommandCodeModels()", () => {
       assert.deepEqual(result.models, [])
       assert.equal(result.source, "empty")
       assert.match(result.warning ?? "", /no valid cached catalog/)
-      assert.match(result.warning ?? "", /until \/commandcode-refresh succeeds/)
+      assert.match(result.warning ?? "", /until \/commandcode:refresh succeeds/)
     })
   })
 

@@ -2,7 +2,7 @@
  * Shared environment plumbing for the quota and usage surfaces.
  *
  * The provider registers against `<base>/provider/v1`, while the quota and
- * usage endpoints live at the host root (`/alpha/...`). Both `/commandcode-quota`
+ * usage endpoints live at the host root (`/alpha/...`). Both `/commandcode:quota`
  * and the usage widget need the same stripped base and the same legacy
  * env-driven ZDR header, so they live here instead of being recomputed.
  */

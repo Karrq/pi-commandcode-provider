@@ -465,7 +465,7 @@ export async function loadCommandCodeModels(
       return {
         models: [],
         source: "empty",
-        warning: `Could not refresh the Command Code model catalog (${errorMessage(liveError)}), and no valid cached catalog is available at ${cachePath} (${errorMessage(cacheError)}). Command Code models will remain unavailable until /commandcode-refresh succeeds.`,
+        warning: `Could not refresh the Command Code model catalog (${errorMessage(liveError)}), and no valid cached catalog is available at ${cachePath} (${errorMessage(cacheError)}). Command Code models will remain unavailable until /commandcode:refresh succeeds.`,
       }
     }
   }

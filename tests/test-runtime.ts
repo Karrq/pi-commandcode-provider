@@ -106,7 +106,7 @@ describe("Command Code runtime", () => {
     assert.deepEqual(pi.providers.at(-1)?.models, [FIRST_MODEL])
     assert.equal(runtime.getStatus().warning, warning)
 
-    const statusCommand = pi.commands.get("commandcode-status")
+    const statusCommand = pi.commands.get("commandcode:status")
     assert.ok(statusCommand)
     await statusCommand("", context)
     assert.equal(context.notifications.at(-1)?.type, "warning")
@@ -132,7 +132,7 @@ describe("Command Code runtime", () => {
     })
 
     const initialization = runtime.initialize()
-    assert.deepEqual([...pi.commands.keys()], ["commandcode-refresh", "commandcode-status"])
+    assert.deepEqual([...pi.commands.keys()], ["commandcode:refresh", "commandcode:status"])
     await Promise.resolve()
     assert.equal(runtime.getStatus().refreshing, true)
     assert.equal(runtime.getStatus().lastAttempt, now)
@@ -141,7 +141,7 @@ describe("Command Code runtime", () => {
     await initialization
     now += 1_000
 
-    const statusCommand = pi.commands.get("commandcode-status")
+    const statusCommand = pi.commands.get("commandcode:status")
     assert.ok(statusCommand)
     await statusCommand("", context)
     const statusMessage = context.notifications.at(-1)?.message ?? ""
@@ -225,7 +225,7 @@ describe("Command Code runtime", () => {
     })
 
     await runtime.initialize()
-    const refreshCommand = pi.commands.get("commandcode-refresh")
+    const refreshCommand = pi.commands.get("commandcode:refresh")
     assert.ok(refreshCommand)
     await refreshCommand("", context)
 
@@ -436,7 +436,7 @@ describe("Command Code runtime", () => {
     })
 
     await runtime.initialize()
-    const statusCommand = pi.commands.get("commandcode-status")
+    const statusCommand = pi.commands.get("commandcode:status")
     assert.ok(statusCommand)
     await statusCommand("", context)
     const message = context.notifications.at(-1)?.message ?? ""

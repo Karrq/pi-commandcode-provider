@@ -336,20 +336,22 @@ describe("Command Code quota", () => {
 
     const output = formatQuota(quota, () => Date.parse("2026-01-15T00:00:00Z"))
     assert.doesNotMatch(output, /Command Code quota —/)
+    assert.match(output, /^Plan: pro \(active\) · renews Feb 1 \(17d\)/)
     assert.match(output, /Credits \[[█░]+\] +82%\n  Remaining: \$55\.00 of \$67\.34/)
     assert.match(output, /Used: \$12\.34/)
-    assert.match(output, /Sources: monthly \$40\.00 \/ purchased \$10\.00 \/ free \$5\.00/)
-    assert.match(output, /Plan: pro \(active\) · renews Feb 1 \(17d\)/)
     assert.match(output, /Usage \(billing period\)/)
     assert.match(output, /Cost: \$12\.34/)
     assert.match(output, /Requests: 1,500/)
     assert.match(output, /Usage windows \(remaining\)/)
     assert.match(output, /5h \[[█░]+\] +50%/)
     assert.match(output, /7d \[[█░]+\] +50%/)
-    assert.match(output, /https:\/\/commandcode\.ai\/usage/)
-    // The account identity is intentionally not part of the report.
+    // The account identity, per-model sources, and the full-detail footer are
+    // intentionally not part of the report.
     assert.doesNotMatch(output, /Account/)
     assert.doesNotMatch(output, /alice-inc/)
+    assert.doesNotMatch(output, /Sources:/)
+    assert.doesNotMatch(output, /Full detail/)
+    assert.doesNotMatch(output, /commandcode\.ai\/usage/)
   })
 
   it("formats renewal dates in UTC and handles renewal edge cases", () => {

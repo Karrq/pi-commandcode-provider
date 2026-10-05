@@ -34,7 +34,7 @@ interface RegisterQuotaCommandOptions {
 }
 
 /**
- * Register `/commandcode-quota`.
+ * Register `/commandcode:quota`.
  *
  * The report is fetched and appended as a `commandcode-quota` session entry,
  * so it persists in the transcript instead of vanishing with a toast. A
@@ -48,7 +48,7 @@ export function registerCommandCodeQuota(
   const getConfiguredKey = options.getConfiguredKey ?? getConfiguredApiKey
   const fetchQuota = options.fetchQuota ?? fetchCommandCodeQuota
 
-  pi.registerCommand("commandcode-quota", {
+  pi.registerCommand("commandcode:quota", {
     description: "Show Command Code account usage and quota",
     handler: async (_args, ctx) => {
       const registryKey = await ctx.modelRegistry?.getApiKeyForProvider?.("commandcode")

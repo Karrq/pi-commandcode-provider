@@ -117,7 +117,7 @@ export class CommandCodeRuntime<TProviderConfig, TContext extends CommandCodeCom
     private readonly options: CommandCodeRuntimeOptions<TProviderConfig>,
   ) {
     this.now = options.now ?? Date.now
-    // Direct console output corrupts the host TUI; warnings remain in /commandcode-status.
+    // Direct console output corrupts the host TUI; warnings remain in /commandcode:status.
     this.logWarning = options.logWarning ?? (() => {})
     const initialStatus: CommandCodeRuntimeStatus = {
       transport: "unknown",
@@ -281,7 +281,7 @@ export class CommandCodeRuntime<TProviderConfig, TContext extends CommandCodeCom
   }
 
   private registerCommands(): void {
-    this.pi.registerCommand("commandcode-refresh", {
+    this.pi.registerCommand("commandcode:refresh", {
       description: "Refresh the Command Code model catalog",
       handler: async (_args, ctx) => {
         await ctx.waitForIdle?.()
@@ -300,7 +300,7 @@ export class CommandCodeRuntime<TProviderConfig, TContext extends CommandCodeCom
       },
     })
 
-    this.pi.registerCommand("commandcode-status", {
+    this.pi.registerCommand("commandcode:status", {
       description: "Show redacted Command Code provider diagnostics",
       handler: async (_args, ctx) => {
         const status = this.getStatus()

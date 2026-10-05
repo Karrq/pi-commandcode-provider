@@ -9,7 +9,7 @@
  * — instead of depending on one host's package.
  *
  * Reports come from the existing quota layer. `fetchCommandCodeQuota` already
- * authenticates and parses the alpha endpoints `/commandcode-quota` uses, so
+ * authenticates and parses the alpha endpoints `/commandcode:quota` uses, so
  * this module only maps that snapshot onto the host's schema.
  */
 
@@ -184,7 +184,7 @@ export function quotaToUsageReport(
       label: "Credits",
       scope,
       // The pool is only known when the billing-period spend is: remaining plus
-      // spent, the same total `/commandcode-quota` prints. Without it the row
+      // spent, the same total `/commandcode:quota` prints. Without it the row
       // reports what is left and claims no fraction of an unknown pool.
       amount: withFractions(
         {
@@ -218,7 +218,7 @@ export function quotaToUsageReport(
 export interface CreateCommandCodeUsageProviderOptions {
   /** Base URL of the Command Code alpha usage endpoints (no `/provider/v1` suffix). */
   apiBase: string
-  /** Extra request headers, e.g. the ZDR flag, matching `/commandcode-quota`. */
+  /** Extra request headers, e.g. the ZDR flag, matching `/commandcode:quota`. */
   headers?: Record<string, string>
   getConfiguredKey?: () => string | undefined
   fetchQuota?: typeof fetchCommandCodeQuota
@@ -229,7 +229,7 @@ export interface CreateCommandCodeUsageProviderOptions {
  *
  * The host resolves an API-key credential before calling and exposes an OAuth
  * credential's bearer as `accessToken`; either way the key is resolved through
- * the same placeholder-aware helper `/commandcode-quota` uses.
+ * the same placeholder-aware helper `/commandcode:quota` uses.
  */
 export function createCommandCodeUsageProvider(
   options: CreateCommandCodeUsageProviderOptions,

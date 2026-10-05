@@ -119,7 +119,7 @@ function createProviderConfig(
     api: COMMAND_CODE_API,
     streamSimple: streamCommandCode,
     headers,
-    // Same alpha endpoints and credentials as the /commandcode-quota command.
+    // Same alpha endpoints and credentials as the /commandcode:quota command.
     usage: createCommandCodeUsageProvider({
       apiBase: alphaApiBase(apiBase),
       headers,
@@ -230,7 +230,7 @@ export default async function (pi: ExtensionAPI) {
     headers: commandCodeEnvHeaders(),
   })
 
-  // `/commandcode-quota` appends its report as a durable session entry, so it
+  // `/commandcode:quota` appends its report as a durable session entry, so it
   // stays in the transcript and never enters the model context. Render it with
   // the same text the command would have notified with.
   pi.registerEntryRenderer<CommandCodeQuota>("commandcode-quota", (entry, _options, _theme) =>

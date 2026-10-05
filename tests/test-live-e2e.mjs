@@ -293,7 +293,7 @@ try {
     )
     const names = commands.data?.commands?.map((command) => command.name) ?? []
 
-    send({ id: "refresh", type: "prompt", message: "/commandcode-refresh" })
+    send({ id: "refresh", type: "prompt", message: "/commandcode:refresh" })
     await waitFor((event) => event.type === "response" && event.id === "refresh" && event.success)
     const refresh = await waitFor(
       (event) =>
@@ -303,7 +303,7 @@ try {
         event.message.includes("model catalog"),
     )
 
-    send({ id: "status", type: "prompt", message: "/commandcode-status" })
+    send({ id: "status", type: "prompt", message: "/commandcode:status" })
     await waitFor((event) => event.type === "response" && event.id === "status" && event.success)
     const status = await waitFor(
       (event) =>
@@ -313,7 +313,7 @@ try {
         event.message.includes("source:"),
     )
 
-    send({ id: "quota", type: "prompt", message: "/commandcode-quota" })
+    send({ id: "quota", type: "prompt", message: "/commandcode:quota" })
     await waitFor((event) => event.type === "response" && event.id === "quota" && event.success)
     const quota = await waitFor(
       (event) =>
@@ -330,9 +330,9 @@ try {
       stderr: getStderr(),
     }
   })
-  assert.ok(runtime.names.includes("commandcode-refresh"))
-  assert.ok(runtime.names.includes("commandcode-status"))
-  assert.ok(runtime.names.includes("commandcode-quota"))
+  assert.ok(runtime.names.includes("commandcode:refresh"))
+  assert.ok(runtime.names.includes("commandcode:status"))
+  assert.ok(runtime.names.includes("commandcode:quota"))
   assert.match(runtime.refresh, /model catalog (?:refreshed|unchanged)/)
   if (expectedTransport) assert.match(runtime.status, new RegExp(`transport: ${expectedTransport}`))
   assert.match(runtime.status, /source: (?:live|cache)/)

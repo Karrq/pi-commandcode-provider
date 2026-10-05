@@ -41,7 +41,7 @@ Run `/login` in pi or OMP. Select **Use a subscription**, then **Command Code**.
 
 If automatic transfer from the browser fails, copy the API key shown by Command Code and paste it into the terminal prompt.
 
-On Oh My Pi, `/login` stores those credentials in OMP's credential store and chat uses them directly. If chat still returns `401 Invalid 'Authorization' header`, restart OMP after `/login` and confirm `/commandcode-quota` shows your account.
+On Oh My Pi, `/login` stores those credentials in OMP's credential store and chat uses them directly. If chat still returns `401 Invalid 'Authorization' header`, restart OMP after `/login` and confirm `/commandcode:quota` shows your account.
 
 ### Environment variable
 
@@ -118,15 +118,15 @@ https://api.commandcode.ai/provider/v1/models
 
 The last successful catalog is cached at `<agent-dir>/commandcode-models.json`. For pi this is `~/.pi/agent/commandcode-models.json` by default. Compatible hosts such as OMP use their own agent directory.
 
-When a valid cache exists, the provider registers the cached catalog immediately and refreshes it from the endpoint in the background, so startup does not wait for the network. The refreshed catalog replaces the cached one as soon as it arrives; `/commandcode-status` reports `source: cache` until then. If the endpoint is temporarily unavailable, the cached catalog stays active. On a first start without a cache, the provider waits for the live catalog; if that fails offline, pi still loads, but Command Code models remain unavailable until the connection is restored and `/commandcode-refresh` succeeds.
+When a valid cache exists, the provider registers the cached catalog immediately and refreshes it from the endpoint in the background, so startup does not wait for the network. The refreshed catalog replaces the cached one as soon as it arrives; `/commandcode:status` reports `source: cache` until then. If the endpoint is temporarily unavailable, the cached catalog stays active. On a first start without a cache, the provider waits for the live catalog; if that fails offline, pi still loads, but Command Code models remain unavailable until the connection is restored and `/commandcode:refresh` succeeds.
 
 While pi is running, use these provider commands without restarting:
 
-- `/commandcode-refresh` fetches and re-registers the current model catalog. Overlapping refreshes are coalesced, and a failed refresh keeps the last valid catalog active.
-- `/commandcode-status` shows redacted discovery diagnostics, including the source, model count, timestamps, cache path, endpoint, and warning.
-- `/commandcode-quota` shows your Command Code account usage and quota in a dashboard-style layout: credits remaining and used with a percentage, monthly/purchased/free sources, the current plan, available usage totals, the API key name, and the 5-hour and weekly usage windows.
+- `/commandcode:refresh` fetches and re-registers the current model catalog. Overlapping refreshes are coalesced, and a failed refresh keeps the last valid catalog active.
+- `/commandcode:status` shows redacted discovery diagnostics, including the source, model count, timestamps, cache path, endpoint, and warning.
+- `/commandcode:quota` shows your Command Code account usage and quota: the current plan first, then credits remaining and used with a bar, available usage totals, and the 5-hour and weekly windows as remaining-percentage bars with reset times. The report is appended as a session entry so it persists in the transcript and is not sent to the model.
 
-The `commandcode-quota` command reads from the Command Code alpha usage endpoints (the same ones the `cmd` CLI `/usage` command uses): `whoami`, `billing/credits`, `billing/subscriptions`, and `usage/summary`. It authenticates with the same API key the provider already uses. If the command cannot reach those endpoints or an endpoint schema changes, unavailable sections are reported explicitly instead of being displayed as zero usage. Output is plain text (via `ui.notify`) so it works across pi and compatible hosts such as OMP.
+The `/commandcode:quota` command reads from the Command Code alpha usage endpoints (the same ones the `cmd` CLI `/usage` command uses): `whoami`, `billing/credits`, `billing/subscriptions`, and `usage/summary`. It authenticates with the same API key the provider already uses. If the command cannot reach those endpoints or an endpoint schema changes, unavailable sections are reported explicitly instead of being displayed as zero usage. In TUI mode the report is rendered from the session entry; other hosts get a plain-text notification so it works across pi and compatible hosts such as OMP.
 
 On Oh My Pi the provider also registers an OMP usage provider through the `usage` field of `pi.registerProvider`, reading the same endpoints with the same credentials. It supplies the account's 5-hour and weekly usage windows, credits remaining and used against the billing-period pool, and the current plan to the host's usage surfaces, and it follows the same rule for sections the API does not report. pi has no such field and ignores it.
 
