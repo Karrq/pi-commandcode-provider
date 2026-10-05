@@ -45,6 +45,7 @@ import { createCommandCodeRuntime } from "./src/runtime.ts"
 import { createCommandCodeUsageProvider, type UsageProvider } from "./src/usage.ts"
 import { transcriptReadersFrom, withTranscriptPromptAndTools } from "./src/transcript.ts"
 import { createCommandCodeTransportRouter } from "./src/transport.ts"
+import { commandCodeZdrFor } from "./src/zdr-state.ts"
 
 const COMMAND_CODE_API = "commandcode-custom"
 const COMPAT_SOURCE_ID = "pi-commandcode-provider"
@@ -118,8 +119,9 @@ function createProviderConfig(
     apiKey: providerApiKey(),
     api: COMMAND_CODE_API,
     streamSimple: streamCommandCode,
-    headers,
     // Same alpha endpoints and credentials as the /commandcode:quota command.
+    // The ZDR header is not set here: the transport resolves it per request so
+    // worker loops that bypass pi's header hook are covered too.
     usage: createCommandCodeUsageProvider({
       apiBase: alphaApiBase(apiBase),
       headers,
@@ -141,7 +143,6 @@ function createProviderConfig(
       cost: MODEL_COSTS[model.id] ?? ZERO_MODEL_COST,
       contextWindow: model.contextWindow,
       maxTokens: model.maxTokens,
-      headers,
       compat:
         model.api === "openai-completions"
           ? {
@@ -183,6 +184,19 @@ export default async function (pi: ExtensionAPI) {
   })
   const resolveStreamOptions = (options?: Parameters<typeof streamNativeProvider>[2]) =>
     withResolvedCommandCodeApiKey(options, getConfiguredApiKey())
+  // Resolve the ZDR header per request, not at registration. Every Command Code
+  // request goes through the transport, including worker agent loops that do
+  // not run pi's `before_provider_headers` hook, so this is the one place that
+  // can make them honor the commandcode-zdr policy.
+  const withZdrHeaders = (
+    model: { id: string },
+    options?: Parameters<typeof streamNativeProvider>[2],
+  ) => {
+    const headers = { ...(options?.headers ?? {}) }
+    if (commandCodeZdrFor(model.id)) headers["x-cmd-zdr"] = "1"
+    else delete headers["x-cmd-zdr"]
+    return { ...options, headers }
+  }
   // The provider transport delegates to pi-ai, which reads the transcript
   // itself. The generate transport builds its own request body and needs the
   // flat prompt and tool fields that pi 0.86+ no longer passes.
@@ -198,13 +212,13 @@ export default async function (pi: ExtensionAPI) {
           compat: model.compatConfig ?? model.compat,
         },
         context,
-        resolveStreamOptions(options),
+        resolveStreamOptions(withZdrHeaders(model, options)),
       ),
     streamGenerate: (model, context, options) =>
       streamGenerate(
         model,
         withTranscriptPromptAndTools(context, transcriptReaders),
-        resolveStreamOptions(options),
+        resolveStreamOptions(withZdrHeaders(model, options)),
       ),
   })
 

@@ -6,6 +6,11 @@
  * from the environment at registration time, so ZDR is either always on or
  * always off for the whole process. This owns the header per request instead.
  *
+ * The decision is published to the provider transport (src/zdr-state.ts), which
+ * is the only path every request takes. That includes the worker agent loops
+ * that other extensions drive directly and that never run pi's
+ * `before_provider_headers` hook, so those honor the same policy.
+ *
  * Settings can be global or project-local:
  *   - global:  <agent-dir>/commandcode-zdr.json
  *   - project: <cwd>/.pi/commandcode-zdr.json, read only when the project is
@@ -19,15 +24,15 @@
  * The provider rejects with HTTP 422 `cmd_zdr_no_providers` when no upstream
  * honours zero data retention for the requested model.
  *
- * How retry works: pi already retries failed requests in its own loop, and
- * every attempt runs `before_provider_headers` again. What it will not do is
- * retry these two errors, because its retryable-error check is a private
- * regex that matches neither. A `message_end` handler can replace a finalized
- * message in place, and pi reads the replacement when it decides whether to
- * retry. So this appends "try your request again" (a phrase that regex does
- * match) to the error text, and pi retries with its usual backoff and its
- * `retry.maxRetries` budget. `after_provider_response` cannot do this job: the
- * HTTP client throws on non-2xx before that hook fires.
+ * How retry works: pi already retries failed requests in its own loop, and the
+ * transport re-runs the decider on each attempt. What it will not do is retry
+ * these two errors, because its retryable-error check is a private regex that
+ * matches neither. A `message_end` handler can replace a finalized message in
+ * place, and pi reads the replacement when it decides whether to retry. So this
+ * appends "try your request again" (a phrase that regex does match) to the
+ * error text, and pi retries with its usual backoff and its `retry.maxRetries`
+ * budget. `after_provider_response` cannot do this job: the HTTP client throws
+ * on non-2xx before that hook fires.
  *
  * Two errors are made retryable:
  *   - ZDR rejection, resolved by the policy above, then retried without the header
@@ -43,9 +48,9 @@ import { dirname, join } from "node:path"
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
 import { getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent"
 import { Container, type SettingItem, SettingsList } from "@earendil-works/pi-tui"
+import { setCommandCodeZdrDecider } from "./src/zdr-state.ts"
 
 const PROVIDER = "commandcode"
-const ZDR_HEADER = "x-cmd-zdr"
 const CONFIG_FILE = "commandcode-zdr.json"
 const CACHE_PATH = join(getAgentDir(), "commandcode-models.json")
 
@@ -156,10 +161,8 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
   const rejected = new Set<string>()
   /** Models the user released for this session only. Never written to disk. */
   const sessionAllow = new Set<string>()
-  /** Models released for exactly the next request. Consumed by the header hook. */
+  /** Models released for exactly the next request. Consumed by the header decider. */
   const onceAllow = new Set<string>()
-  /** Set between before_provider_headers and the message_end for the same request. */
-  let inflight: { modelId: string; sentZdr: boolean } | null = null
   /** Project root for project-scoped reads and writes. */
   let cwd = process.cwd()
   let projectTrusted = false
@@ -182,6 +185,10 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     rejected.clear()
     for (const modelId of config?.rejected ?? []) rejected.add(modelId)
     scope = project ? "project" : "global"
+    // The provider transport is the only path every request takes, including
+    // worker agent loops that never run pi's header hook. Publish the decision
+    // there. A missing config file leaves it to the CMD_ZDR environment.
+    setCommandCodeZdrDecider(config ? (modelId) => sendZdrFor(modelId) : undefined)
   }
 
   function scopePath(target: ZdrScope): string {
@@ -275,23 +282,14 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     resolveConfig(ctx)
   })
 
-  pi.on("before_provider_headers", async (event, ctx) => {
-    if (!config) return
-    const model = ctx.model
-    if (!model || model.provider !== PROVIDER) return
-
-    const send = sendZdrFor(model.id)
-    inflight = { modelId: model.id, sentZdr: send }
-    // A null value deletes the header instead of sending an empty string.
-    event.headers[ZDR_HEADER] = send ? "1" : null
+  pi.on("session_shutdown", async () => {
+    setCommandCodeZdrDecider(undefined)
   })
 
   pi.on("message_end", async (event, ctx) => {
     const message = event.message
     if (message.role !== "assistant") return
 
-    const pending = inflight
-    inflight = null
     if (message.provider !== PROVIDER || message.stopReason !== "error" || !message.errorMessage)
       return
 
@@ -300,8 +298,11 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
 
     if (EMPTY_RESPONSE.test(error)) return retryable
 
-    if (!config || !pending?.sentZdr || !ZDR_REJECTION.test(error)) return
-    return (await resolveRejection(ctx, config, pending.modelId)) ? retryable : undefined
+    // The transport owns the header decision, so a rejection is any error from
+    // an enabled policy. The model id comes from the message that failed.
+    const modelId = (message as { model?: string }).model ?? ctx.model?.id
+    if (!config || !modelId || !ZDR_REJECTION.test(error)) return
+    return (await resolveRejection(ctx, config, modelId)) ? retryable : undefined
   })
 
   /** Modal model picker used by the "+ exclude a model" row. */
