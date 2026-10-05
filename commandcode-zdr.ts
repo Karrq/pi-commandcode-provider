@@ -34,7 +34,9 @@
  * `COMMANDCODE_ZDR_ARMED` is mirrored in the environment while armed so
  * spawned subagents inherit it. Shell commands the textual path check misses
  * are sent to the pi-jev classifier provider `local-jev`; a near-0.5 result
- * (low confidence) asks the user, and with no terminal arms instead. A ZDR
+ * (low confidence) asks the user, and with no terminal arms instead. That
+ * prompt can turn zone checks off for the rest of the session, for when the
+ * classifier is unreachable and every command would otherwise ask. A ZDR
  * rejection while armed never falls back: resolveRejection refuses.
  *
  * The provider rejects with HTTP 422 `cmd_zdr_no_providers` when no upstream
@@ -283,6 +285,11 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
   let zones: string[] = []
   /** Recent Jev answers, keyed by command, so repeated calls do not re-classify. */
   const jevCache = new Map<string, { at: number; probability: number }>()
+  /**
+   * Session escape hatch chosen at the Jev prompt: zone reads no longer arm ZDR
+   * for the rest of the session. In memory only; a reload starts guarded again.
+   */
+  let zoneGuardOff = false
 
   /**
    * Resolve the effective config for a session.
@@ -388,11 +395,29 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
   }
 
   /**
+   * Turn zone detection off (or back on) for this session only. Off means a
+   * zone read no longer arms ZDR and the Jev prompt stops appearing. It never
+   * clears arming that already happened: already-read content stays protected.
+   */
+  function setZoneGuardOff(ctx: ExtensionContext, off: boolean): void {
+    if (zoneGuardOff === off) return
+    zoneGuardOff = off
+    ctx.ui.notify(
+      off
+        ? "ZDR zone checks are off for the rest of this session: reads inside a zone will not arm ZDR. /commandcode:zdr can turn them back on."
+        : "ZDR zone checks are back on for this session.",
+      off ? "warning" : "info",
+    )
+  }
+
+  /**
    * Recompute arming from the current branch, the cwd, and the inherited env.
    * Navigating to a branch that never armed disarms; arming found there (or in
    * the cwd, or inherited from a parent) is persisted so it survives a reload.
    */
   function recomputeArmed(ctx: ExtensionContext): void {
+    // Zone checks were turned off for this session; do not arm on branch changes.
+    if (zoneGuardOff) return
     const inherited = process.env[ARMED_ENV] === "1"
     const marker = armedFromEntries(ctx.sessionManager.getBranch() as unknown[])
     const cwdZone = zones.find((zone) => pathInZones(cwd, [zone], cwd))
@@ -488,7 +513,9 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
   })
 
   pi.on("tool_call", async (event, ctx) => {
-    if (zones.length === 0) return
+    // Nothing to detect without zones, with the session guard off, or when an
+    // earlier read already armed the branch (the header is already on).
+    if (zones.length === 0 || zoneGuardOff || armed) return
     const input = (event.input ?? {}) as Record<string, unknown>
     if (event.toolName === "bash") {
       const command = typeof input.command === "string" ? input.command : ""
@@ -525,6 +552,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     command: string,
   ): Promise<{ block?: boolean; reason?: string } | undefined> {
     if (config?.zonesJev === false) return
+    if (zoneGuardOff || armed) return
     const models = ctx.modelRegistry.getModelsOfType("classifier", JEV_PROVIDER)
     if (models.length === 0) return
 
@@ -586,10 +614,19 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
 
     const choice = await ctx.ui.select(
       `This command may read a ZDR zone.\n${command}\n\n${detail}`,
-      ["Arm ZDR for this session (recommended)", "Run it without arming", "Block the command"],
+      [
+        "Arm ZDR for this session (recommended)",
+        "Run it without arming",
+        "Don't arm for the rest of this session",
+        "Block the command",
+      ],
     )
     if (choice === "Arm ZDR for this session (recommended)") {
       arm(ctx, "jev", command)
+      return
+    }
+    if (choice === "Don't arm for the rest of this session") {
+      setZoneGuardOff(ctx, true)
       return
     }
     if (choice === "Block the command") {
@@ -686,6 +723,15 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
             values: ["on", "off"],
           },
           {
+            id: "zoneGuard",
+            label: "Zone checks (this session)",
+            description: zoneGuardOff
+              ? "off: a read inside a zone does not arm ZDR for the rest of this session. Switch to on to restore. Arming already in effect is kept."
+              : "on: a read or command inside a zone arms ZDR for the session.",
+            currentValue: zoneGuardOff ? "off" : "on",
+            values: ["on", "off"],
+          },
+          {
             id: "armed",
             label: "Zone enforcement",
             description: armed
@@ -756,6 +802,10 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
             }
             if (id === "zonesJev") {
               apply({ ...current, zonesJev: newValue === "on" })
+              return
+            }
+            if (id === "zoneGuard") {
+              setZoneGuardOff(ctx, newValue === "off")
               return
             }
             if (id === "enabled") {
