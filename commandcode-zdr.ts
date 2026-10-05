@@ -24,7 +24,9 @@
  * plus `zones` and its Jev settings; see below.
  *
  * ZDR zones: a zone is a folder whose content must never reach a model
- * without zero-data-retention. When a tool touches one, the session becomes
+ * without zero-data-retention. A zone may use `*`, `?` and `**` glob wildcards,
+ * so `~/Altius-*` covers every sibling directory with that prefix. When a tool
+ * touches one, the session becomes
  * "armed": every later request carries x-cmd-zdr: 1 no matter what enabled,
  * exclusions, or rejected say (armed wins). Arming is written as a
  * `commandcode-zdr.armed` session entry and recomputed from the current

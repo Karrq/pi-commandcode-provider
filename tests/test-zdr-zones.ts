@@ -78,6 +78,28 @@ describe("pathInZones", () => {
     assert.equal(pathInZones("", ["/a/b"], CWD), false)
     assert.equal(pathInZones("   ", ["/a/b"], CWD), false)
   })
+
+  it("matches a glob zone at a directory boundary", () => {
+    const zone = join(HOME, "Altius-*")
+    assert.equal(pathInZones(join(HOME, "Altius-Chain"), [zone], CWD), true)
+    assert.equal(pathInZones(join(HOME, "Altius-Chain", "src", "a.ts"), [zone], CWD), true)
+  })
+
+  it("does not match a glob zone without the literal stem", () => {
+    const zone = join(HOME, "Altius-*")
+    assert.equal(pathInZones(join(HOME, "Altius"), [zone], CWD), false)
+    assert.equal(pathInZones(join(HOME, "AltiusStuff"), [zone], CWD), false)
+  })
+
+  it("keeps `*` inside one path segment and lets `**` cross separators", () => {
+    assert.equal(pathInZones("/a/b/x/c/deep", ["/a/*/c"], CWD), false)
+    assert.equal(pathInZones("/a/b/c/deep", ["/a/**"], CWD), true)
+  })
+
+  it("treats `?` as one character inside a segment", () => {
+    assert.equal(pathInZones("/zones/ab", ["/zones/a?"], CWD), true)
+    assert.equal(pathInZones("/zones/abc", ["/zones/a?"], CWD), false)
+  })
 })
 
 describe("commandMentionsZone", () => {
@@ -109,6 +131,18 @@ describe("commandMentionsZone", () => {
       commandMentionsZone("cat /zones/pri'vate'/f.txt", ["/zones/private"], CWD),
       undefined,
     )
+  })
+
+  it("matches a glob zone by its literal stem", () => {
+    const zone = join(HOME, "Altius-*")
+    assert.equal(commandMentionsZone("cat ~/Altius-Chain/README.md", [zone], CWD), zone)
+    assert.equal(commandMentionsZone(`cat ${join(HOME, "Altius-HPEC")}/a`, [zone], CWD), zone)
+  })
+
+  it("does not match a glob zone without the literal stem", () => {
+    const zone = join(HOME, "Altius-*")
+    assert.equal(commandMentionsZone("cat ~/AltiusStuff/a", [zone], CWD), undefined)
+    assert.equal(commandMentionsZone("ls /tmp", [zone], CWD), undefined)
   })
 })
 
