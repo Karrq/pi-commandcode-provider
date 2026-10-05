@@ -6,6 +6,11 @@
  * from the environment at registration time, so ZDR is either always on or
  * always off for the whole process. This owns the header per request instead.
  *
+ * Settings can be global or project-local:
+ *   - global:  <agent-dir>/commandcode-zdr.json
+ *   - project: <cwd>/.pi/commandcode-zdr.json, read only when the project is
+ *     trusted, and overriding the global file field by field
+ *
  * Three settings:
  *   - enforcement: on / off
  *   - exclusions:  model ids that never receive the header
@@ -34,16 +39,15 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
-import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
-import { getSettingsListTheme } from "@earendil-works/pi-coding-agent"
+import { getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent"
 import { Container, type SettingItem, SettingsList } from "@earendil-works/pi-tui"
 
 const PROVIDER = "commandcode"
 const ZDR_HEADER = "x-cmd-zdr"
-const CONFIG_PATH = join(homedir(), ".pi", "agent", "commandcode-zdr.json")
-const CACHE_PATH = join(homedir(), ".pi", "agent", "commandcode-models.json")
+const CONFIG_FILE = "commandcode-zdr.json"
+const CACHE_PATH = join(getAgentDir(), "commandcode-models.json")
 
 const ZDR_REJECTION = /cmd_zdr_no_providers|no zero-data-retention upstream/i
 const EMPTY_RESPONSE = /empty response/i
@@ -52,6 +56,9 @@ const RETRY_HINT = " (try your request again)"
 
 /** What to do when the provider refuses a request for lacking ZDR routing. */
 type Policy = "ask" | "fallback" | "block"
+
+/** Which file the settings editor writes. */
+type ZdrScope = "global" | "project"
 
 interface ZdrConfig {
   enabled: boolean
@@ -65,6 +72,14 @@ interface ZdrConfig {
    * silently downgrade the next request.
    */
   rejected: string[]
+}
+
+/** A config file as written: every field optional so scopes can merge. */
+interface ZdrConfigFile {
+  enabled?: boolean
+  exclusions?: string[]
+  onUnsupported?: Policy
+  rejected?: string[]
 }
 
 const POLICIES: Policy[] = ["ask", "fallback", "block"]
@@ -86,7 +101,8 @@ function stringList(value: unknown): string[] {
     : []
 }
 
-function parseConfig(raw: string): ZdrConfig | null {
+/** Only present, valid fields are kept so a project file can override a subset. */
+function parseConfigFile(raw: string): ZdrConfigFile | null {
   let parsed: unknown
   try {
     parsed = JSON.parse(raw)
@@ -94,44 +110,91 @@ function parseConfig(raw: string): ZdrConfig | null {
     return null
   }
   if (typeof parsed !== "object" || parsed === null) return null
-  const candidate = parsed as Partial<ZdrConfig>
+  const candidate = parsed as Partial<ZdrConfigFile>
+  const file: ZdrConfigFile = {}
+  if (typeof candidate.enabled === "boolean") file.enabled = candidate.enabled
+  if (isPolicy(candidate.onUnsupported)) file.onUnsupported = candidate.onUnsupported
+  if (candidate.exclusions !== undefined) file.exclusions = stringList(candidate.exclusions)
+  if (candidate.rejected !== undefined) file.rejected = stringList(candidate.rejected)
+  return file
+}
+
+function globalConfigPath(): string {
+  return join(getAgentDir(), CONFIG_FILE)
+}
+
+function projectConfigPath(cwd: string): string {
+  return join(cwd, ".pi", CONFIG_FILE)
+}
+
+function readConfigFile(path: string): ZdrConfigFile | null {
+  if (!existsSync(path)) return null
+  try {
+    return parseConfigFile(readFileSync(path, "utf8"))
+  } catch {
+    return null
+  }
+}
+
+function mergeConfigFiles(
+  global: ZdrConfigFile | null,
+  project: ZdrConfigFile | null,
+): ZdrConfig | null {
+  if (!global && !project) return null
   return {
-    enabled: typeof candidate.enabled === "boolean" ? candidate.enabled : DEFAULT_CONFIG.enabled,
-    exclusions: stringList(candidate.exclusions),
-    onUnsupported: isPolicy(candidate.onUnsupported)
-      ? candidate.onUnsupported
-      : DEFAULT_CONFIG.onUnsupported,
-    rejected: stringList(candidate.rejected),
+    enabled: project?.enabled ?? global?.enabled ?? DEFAULT_CONFIG.enabled,
+    exclusions: project?.exclusions ?? global?.exclusions ?? [],
+    onUnsupported: project?.onUnsupported ?? global?.onUnsupported ?? DEFAULT_CONFIG.onUnsupported,
+    rejected: [...new Set([...(global?.rejected ?? []), ...(project?.rejected ?? [])])],
   }
 }
 
 export default function commandCodeZdr(pi: ExtensionAPI) {
-  /** null until the user saves settings once; Command Code keeps owning the header until then. */
-  let config: ZdrConfig | null = readConfig()
-  /** Hydrated from the config file so learned rejections survive a restart. */
-  const rejected = new Set<string>(config?.rejected ?? [])
+  /** Effective config for the current session; null until a config file exists. */
+  let config: ZdrConfig | null = null
+  /** Hydrated from the effective config so learned rejections survive a restart. */
+  const rejected = new Set<string>()
   /** Models the user released for this session only. Never written to disk. */
   const sessionAllow = new Set<string>()
   /** Models released for exactly the next request. Consumed by the header hook. */
   const onceAllow = new Set<string>()
   /** Set between before_provider_headers and the message_end for the same request. */
   let inflight: { modelId: string; sentZdr: boolean } | null = null
+  /** Project root for project-scoped reads and writes. */
+  let cwd = process.cwd()
+  let projectTrusted = false
+  /** Where the editor writes; defaults to the project file when one exists. */
+  let scope: ZdrScope = "global"
 
-  function readConfig(): ZdrConfig | null {
-    if (!existsSync(CONFIG_PATH)) return null
-    try {
-      return parseConfig(readFileSync(CONFIG_PATH, "utf8"))
-    } catch {
-      return null
-    }
+  /**
+   * Resolve the effective config for a session.
+   *
+   * The project file only participates when the project is trusted, the same
+   * gate pi applies to project settings. A project field overrides the global
+   * one; learned rejections are the union of both.
+   */
+  function resolveConfig(ctx: ExtensionContext): void {
+    cwd = ctx.cwd
+    projectTrusted = ctx.isProjectTrusted()
+    const global = readConfigFile(globalConfigPath())
+    const project = projectTrusted ? readConfigFile(projectConfigPath(cwd)) : null
+    config = mergeConfigFiles(global, project)
+    rejected.clear()
+    for (const modelId of config?.rejected ?? []) rejected.add(modelId)
+    scope = project ? "project" : "global"
   }
 
-  function saveConfig(next: ZdrConfig): void {
+  function scopePath(target: ZdrScope): string {
+    return target === "project" ? projectConfigPath(cwd) : globalConfigPath()
+  }
+
+  function saveConfig(next: ZdrConfig, target: ZdrScope = scope): void {
     // The in-memory set is the source of truth for rejections, so a settings
     // edit mid-session cannot write back a stale copy.
     const merged: ZdrConfig = { ...next, rejected: [...rejected] }
-    mkdirSync(dirname(CONFIG_PATH), { recursive: true })
-    writeFileSync(CONFIG_PATH, `${JSON.stringify(merged, null, 2)}\n`, "utf8")
+    const path = scopePath(target)
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, `${JSON.stringify(merged, null, 2)}\n`, "utf8")
     config = merged
   }
 
@@ -208,6 +271,10 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     }
   }
 
+  pi.on("session_start", async (_event, ctx) => {
+    resolveConfig(ctx)
+  })
+
   pi.on("before_provider_headers", async (event, ctx) => {
     if (!config) return
     const model = ctx.model
@@ -260,15 +327,31 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
         return
       }
 
+      // Re-resolve so the editor reflects the session's cwd and trust even if
+      // session_start never ran for this context.
+      resolveConfig(ctx)
+
       // Opening the editor is the opt-in that takes header ownership over.
       let current = config ?? { ...DEFAULT_CONFIG }
+
       const apply = (next: ZdrConfig) => {
         current = next
         saveConfig(next)
       }
 
       await ctx.ui.custom((tui, theme, _keybindings, done) => {
+        const scopeItem: SettingItem = {
+          id: "scope",
+          label: "Save settings to",
+          description: projectTrusted
+            ? "global: every project. project: this repo only, in .pi/commandcode-zdr.json. Switching writes the current values to that scope."
+            : "global: every project. Project scope is unavailable until this project is trusted.",
+          currentValue: scope === "project" ? "project" : "global",
+          values: projectTrusted ? ["global", "project"] : ["global"],
+        }
+
         const items: SettingItem[] = [
+          scopeItem,
           {
             id: "enabled",
             label: "ZDR enforcement",
@@ -321,6 +404,14 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
           Math.min(items.length + 2, 15),
           getSettingsListTheme(),
           (id, newValue) => {
+            if (id === "scope") {
+              if (newValue !== "global" && newValue !== "project") return
+              if (newValue === "project" && !projectTrusted) return
+              scope = newValue
+              // Persist the current values into the new scope so it now owns them.
+              saveConfig(current, scope)
+              return
+            }
             if (id === "enabled") {
               apply({ ...current, enabled: newValue === "on" })
               return
@@ -386,7 +477,9 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
       })
 
       ctx.ui.notify(
-        current.enabled ? `ZDR on, ${current.exclusions.length} model(s) excluded` : "ZDR off",
+        current.enabled
+          ? `ZDR on for ${scope}, ${current.exclusions.length} model(s) excluded`
+          : `ZDR off for ${scope}`,
         "info",
       )
     },
