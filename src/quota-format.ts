@@ -23,7 +23,7 @@ export function formatWindowLimits(
   })
 }
 
-function formatResetClock(resetAtSeconds: number, now: () => number): string {
+export function formatResetClock(resetAtSeconds: number, now: () => number): string {
   const date = new Date(resetAtSeconds * 1000)
   if (Number.isNaN(date.getTime())) return "unknown"
   const diffMs = date.getTime() - now()

@@ -6,6 +6,11 @@ import type { CommandCodeQuotaResult } from "../src/quota-types.ts"
 
 class CommandApiDouble {
   handler?: (args: string, ctx: QuotaCommandContext) => Promise<void>
+  readonly entries: Array<{ type: string; data?: unknown }> = []
+
+  appendEntry<T>(customType: string, data?: T): void {
+    this.entries.push({ type: customType, data })
+  }
 
   registerCommand(
     name: string,
@@ -20,13 +25,10 @@ class CommandApiDouble {
   }
 }
 
-function context(registryKey: string | undefined) {
+function context(registryKey: string | undefined, mode: QuotaCommandContext["mode"] = "tui") {
   const notifications: Array<{ message: string; type?: "info" | "warning" | "error" }> = []
-  let waited = false
   const value = {
-    async waitForIdle() {
-      waited = true
-    },
+    mode,
     modelRegistry: {
       async getApiKeyForProvider(provider: string) {
         assert.equal(provider, "commandcode")
@@ -39,7 +41,7 @@ function context(registryKey: string | undefined) {
       },
     },
   } satisfies QuotaCommandContext
-  return { value, notifications, waited: () => waited }
+  return { value, notifications }
 }
 
 const quotaResult: CommandCodeQuotaResult = {
@@ -53,7 +55,7 @@ const quotaResult: CommandCodeQuotaResult = {
 }
 
 describe("commandcode-quota command", () => {
-  it("registers the command and resolves OMP placeholders through the fallback key", async () => {
+  it("resolves OMP placeholders through the fallback key and persists the report", async () => {
     const pi = new CommandApiDouble()
     let requestKey = ""
     let requestBase = ""
@@ -70,9 +72,29 @@ describe("commandcode-quota command", () => {
     assert.ok(pi.handler)
     const ctx = context("$COMMAND_CODE_API_KEY")
     await pi.handler("", ctx.value)
-    assert.equal(ctx.waited(), true)
     assert.equal(requestKey, "fallback-key")
     assert.equal(requestBase, "https://api.commandcode.ai")
+    assert.deepEqual(
+      pi.entries.map((entry) => entry.type),
+      ["commandcode-quota"],
+    )
+    assert.equal(pi.entries[0]?.data, quotaResult.quota)
+    // TUI renders the appended entry; no transient toast is needed.
+    assert.equal(ctx.notifications.length, 0)
+  })
+
+  it("notifies non-TUI hosts that cannot render session entries", async () => {
+    const pi = new CommandApiDouble()
+    registerCommandCodeQuota(pi, {
+      apiBase: "https://api.commandcode.ai",
+      getConfiguredKey: () => "real-key",
+      fetchQuota: async () => quotaResult,
+    })
+
+    assert.ok(pi.handler)
+    const ctx = context("real-key", "print")
+    await pi.handler("", ctx.value)
+    assert.equal(pi.entries.length, 1)
     assert.equal(ctx.notifications.at(-1)?.type, "info")
     assert.match(ctx.notifications.at(-1)?.message ?? "", /Requests: 2/)
   })
@@ -93,6 +115,7 @@ describe("commandcode-quota command", () => {
     const ctx = context(undefined)
     await pi.handler("", ctx.value)
     assert.equal(called, false)
+    assert.equal(pi.entries.length, 0)
     assert.equal(ctx.notifications.at(-1)?.type, "warning")
     assert.match(ctx.notifications.at(-1)?.message ?? "", /requires an API key/)
   })
@@ -111,6 +134,7 @@ describe("commandcode-quota command", () => {
     assert.ok(pi.handler)
     const ctx = context("real-key")
     await pi.handler("", ctx.value)
+    assert.equal(pi.entries.length, 0)
     assert.equal(ctx.notifications.at(-1)?.type, "error")
     assert.doesNotMatch(ctx.notifications.at(-1)?.message ?? "", /supersecret/)
   })

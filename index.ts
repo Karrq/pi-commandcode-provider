@@ -14,6 +14,7 @@ import {
   type ExtensionCommandContext,
   type ProviderConfig,
 } from "@earendil-works/pi-coding-agent"
+import { Text } from "@earendil-works/pi-tui"
 import { join } from "node:path"
 
 import { getConfiguredApiKey } from "./src/api-key.ts"
@@ -37,6 +38,9 @@ import { getApiKey as getOAuthApiKey, login, refreshToken } from "./src/oauth.ts
 import { normalizeCommandCodeMessage } from "./src/overflow.ts"
 import { MODEL_COSTS, ZERO_MODEL_COST } from "./src/pricing.ts"
 import { registerCommandCodeQuota } from "./src/quota-command.ts"
+import { alphaApiBase, commandCodeEnvHeaders } from "./src/quota-env.ts"
+import { formatQuota } from "./src/quota-format.ts"
+import type { CommandCodeQuota } from "./src/quota-types.ts"
 import { createCommandCodeRuntime } from "./src/runtime.ts"
 import { createCommandCodeUsageProvider, type UsageProvider } from "./src/usage.ts"
 import { transcriptReadersFrom, withTranscriptPromptAndTools } from "./src/transcript.ts"
@@ -93,13 +97,6 @@ function providerApiKey(): string | undefined {
   return compatApiProviderRegistrar() ? "$COMMAND_CODE_API_KEY" : undefined
 }
 
-function commandCodeHeaders(): Record<string, string> | undefined {
-  if (process.env.CMD_ZDR === "1" || process.env.COMMANDCODE_ZDR === "1") {
-    return { "x-cmd-zdr": "1" }
-  }
-  return undefined
-}
-
 /**
  * The registered config, plus Oh My Pi's extension-only usage hook.
  *
@@ -114,7 +111,7 @@ function createProviderConfig(
   apiBase: string,
   streamCommandCode: ProviderConfig["streamSimple"],
 ): CommandCodeProviderConfig {
-  const headers = commandCodeHeaders()
+  const headers = commandCodeEnvHeaders()
   return {
     name: "Command Code",
     baseUrl: apiBase,
@@ -124,7 +121,7 @@ function createProviderConfig(
     headers,
     // Same alpha endpoints and credentials as the /commandcode-quota command.
     usage: createCommandCodeUsageProvider({
-      apiBase: legacyApiBase(apiBase),
+      apiBase: alphaApiBase(apiBase),
       headers,
     }),
     oauth: {
@@ -164,10 +161,6 @@ function createProviderConfig(
   }
 }
 
-function legacyApiBase(providerApiBase: string): string {
-  return providerApiBase.replace(/\/provider\/v1\/?$/, "")
-}
-
 export default async function (pi: ExtensionAPI) {
   // Hosts may select their built-in Command Code model before loading extensions.
   // Rebind that stale selection to our registered transport before the first turn.
@@ -186,7 +179,7 @@ export default async function (pi: ExtensionAPI) {
   const streamGenerate = createStreamCommandCode({
     createStream: () => new AssistantMessageEventStream(),
     calculateCost: calculateCommandCodeCost,
-    apiBase: legacyApiBase(apiBase),
+    apiBase: alphaApiBase(apiBase),
   })
   const resolveStreamOptions = (options?: Parameters<typeof streamNativeProvider>[2]) =>
     withResolvedCommandCodeApiKey(options, getConfiguredApiKey())
@@ -233,9 +226,16 @@ export default async function (pi: ExtensionAPI) {
   })
 
   registerCommandCodeQuota(pi, {
-    apiBase: legacyApiBase(apiBase),
-    headers: commandCodeHeaders(),
+    apiBase: alphaApiBase(apiBase),
+    headers: commandCodeEnvHeaders(),
   })
+
+  // `/commandcode-quota` appends its report as a durable session entry, so it
+  // stays in the transcript and never enters the model context. Render it with
+  // the same text the command would have notified with.
+  pi.registerEntryRenderer<CommandCodeQuota>("commandcode-quota", (entry, _options, _theme) =>
+    entry.data === undefined ? undefined : new Text(formatQuota(entry.data), 1, 0),
+  )
 
   const runtime = createCommandCodeRuntime<ProviderConfig, ExtensionCommandContext>(pi, {
     endpoint: modelsUrl,

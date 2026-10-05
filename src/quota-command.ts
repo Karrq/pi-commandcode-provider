@@ -2,9 +2,10 @@ import { getConfiguredApiKey } from "./api-key.ts"
 import { pickCommandCodeApiKey } from "./converters.ts"
 import { fetchCommandCodeQuota, redactValue } from "./quota.ts"
 import { formatQuota } from "./quota-format.ts"
+import type { CommandCodeQuota } from "./quota-types.ts"
 
 export interface QuotaCommandContext {
-  waitForIdle?: () => Promise<void>
+  mode?: "tui" | "rpc" | "json" | "print"
   modelRegistry?: {
     getApiKeyForProvider?: (provider: string) => Promise<string | undefined>
   }
@@ -21,6 +22,8 @@ interface QuotaCommandApi {
       handler: (args: string, ctx: QuotaCommandContext) => Promise<void>
     },
   ): void
+  /** Persists the report as a session entry; absent only in structural test doubles. */
+  appendEntry?<T = unknown>(customType: string, data?: T): void
 }
 
 interface RegisterQuotaCommandOptions {
@@ -30,6 +33,14 @@ interface RegisterQuotaCommandOptions {
   fetchQuota?: typeof fetchCommandCodeQuota
 }
 
+/**
+ * Register `/commandcode-quota`.
+ *
+ * The report is fetched and appended as a `commandcode-quota` session entry,
+ * so it persists in the transcript instead of vanishing with a toast. A
+ * renderer registered by the provider entry point draws the entry. Non-TUI
+ * hosts have no transcript renderer, so they still get a notification.
+ */
 export function registerCommandCodeQuota(
   pi: QuotaCommandApi,
   options: RegisterQuotaCommandOptions,
@@ -40,7 +51,6 @@ export function registerCommandCodeQuota(
   pi.registerCommand("commandcode-quota", {
     description: "Show Command Code account usage and quota",
     handler: async (_args, ctx) => {
-      await ctx.waitForIdle?.()
       const registryKey = await ctx.modelRegistry?.getApiKeyForProvider?.("commandcode")
       const apiKey = pickCommandCodeApiKey(registryKey, getConfiguredKey())
       if (!apiKey) {
@@ -60,7 +70,11 @@ export function registerCommandCodeQuota(
         ctx.ui.notify(redactValue(result.error.message), "error")
         return
       }
-      ctx.ui.notify(formatQuota(result.quota), "info")
+
+      pi.appendEntry?.<CommandCodeQuota>("commandcode-quota", result.quota)
+      if (ctx.mode !== "tui") {
+        ctx.ui.notify(formatQuota(result.quota), "info")
+      }
     },
   })
 }
