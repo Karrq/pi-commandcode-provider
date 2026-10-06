@@ -30,7 +30,10 @@
  * "armed": every later request carries x-cmd-zdr: 1 no matter what enabled,
  * exclusions, or rejected say (armed wins). Arming is written as a
  * `commandcode-zdr.armed` session entry and recomputed from the current
- * branch, so navigating to a branch that never touched a zone disarms.
+ * branch, so navigating to a branch that never touched a zone disarms. While
+ * armed the session is moved to the `commandcode-zdr` provider, the same catalog
+ * with zero data retention always on, so the footer and the worker agent loops
+ * follow the decision; disarming moves it back.
  * `COMMANDCODE_ZDR_ARMED` is mirrored in the environment while armed so
  * spawned subagents inherit it. Shell commands the textual path check misses
  * are sent to the pi-jev classifier provider `local-jev`; a near-0.5 result
@@ -69,7 +72,16 @@ import { dirname, join } from "node:path"
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
 import { getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent"
 import { Container, type SettingItem, SettingsList } from "@earendil-works/pi-tui"
-import { setCommandCodeZdrDecider } from "./src/zdr-state.ts"
+import {
+  COMMAND_CODE_PROVIDER,
+  COMMAND_CODE_ZDR_PROVIDER,
+  isCommandCodeProvider,
+} from "./src/providers.ts"
+import {
+  republishCommandCodeZdr,
+  setCommandCodeZdrDecider,
+  setCommandCodeZdrExcluded,
+} from "./src/zdr-state.ts"
 import {
   ZDR_ARMED_ENTRY,
   type ArmedMarker,
@@ -80,7 +92,8 @@ import {
   pathInZones,
 } from "./src/zdr-zones.ts"
 
-const PROVIDER = "commandcode"
+const PROVIDER = COMMAND_CODE_PROVIDER
+const ZDR_PROVIDER = COMMAND_CODE_ZDR_PROVIDER
 /** Namespace inside settings.json: `"commandcode-zdr": { ... }`. */
 const SETTINGS_KEY = "commandcode-zdr"
 /** Pre-settings.json config location, read once to migrate an existing config. */
@@ -92,8 +105,6 @@ const JEV_CACHE_TTL_MS = 60_000
 const DEFAULT_JEV_MIN_CONFIDENCE = 0.6
 /** Session entry recording one Jev consult about a shell command. Data-only. */
 const ZDR_JEV_ENTRY = "commandcode-zdr.jev"
-/** Footer status key; pi renders it on the extension-status line. */
-const STATUS_KEY = "zdr"
 
 /** Tool input field that carries a path, for the tools that read one directly. */
 const READ_TOOL_PATH: Record<string, string> = {
@@ -347,8 +358,8 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
       .map((zone) => normalizeZone(zone, cwd))
       .filter((zone): zone is string => zone !== undefined)
     scope = project ? "project" : "global"
+    setCommandCodeZdrExcluded(config?.exclusions ?? [])
     publishDecider()
-    updateStatus(ctx)
   }
 
   /**
@@ -361,23 +372,36 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     setCommandCodeZdrDecider(config || armed ? (modelId) => sendZdrFor(modelId) : undefined)
   }
 
-  /** Last UI-bearing context, so the badge can be cleared from a helper without one. */
-  let statusCtx: ExtensionContext | undefined
+  /** Guard so a provider switch does not re-enter through its own model_select. */
+  let switching = false
 
   /**
-   * Footer badge for what the next Command Code request will do: `armed` when a
-   * protected zone was touched, `on` when enforcement is enabled, and nothing
-   * when ZDR is off. pi renders extension statuses on their own footer line; it
-   * has no inline slot next to the model name.
+   * Move the session onto the provider that matches the armed state: the ZDR
+   * provider while armed, the plain one otherwise, keeping the model id. Models
+   * the ZDR policy excludes are absent from the ZDR catalog, so an armed session
+   * stays on the plain provider for them.
    */
-  function updateStatus(ctx?: ExtensionContext): void {
-    if (ctx) statusCtx = ctx
-    const target = statusCtx
-    if (!target?.hasUI) return
-    target.ui.setStatus(
-      STATUS_KEY,
-      armed ? "[ZDR] armed" : config?.enabled ? "[ZDR] on" : undefined,
-    )
+  async function applyProviderForArmed(ctx: ExtensionContext): Promise<void> {
+    const model = ctx.model
+    if (!model || switching) return
+    const wanted = armed ? ZDR_PROVIDER : PROVIDER
+    const current = armed ? PROVIDER : ZDR_PROVIDER
+    if (model.provider !== current) return
+    const target = ctx.modelRegistry.find(wanted, model.id)
+    if (!target) return
+    switching = true
+    try {
+      // setModel returns false until the host finishes its auth refresh for the
+      // freshly registered ZDR provider, so retry briefly.
+      for (let attempt = 0; attempt < 4; attempt++) {
+        if (await pi.setModel(target)) return
+        await new Promise((resolve) => setTimeout(resolve, 150))
+      }
+    } catch {
+      // A failed switch is cosmetic: arming still forces the header in the transport.
+    } finally {
+      switching = false
+    }
   }
 
   function scopePath(target: ZdrScope): string {
@@ -390,6 +414,9 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     const merged: ZdrConfig = { ...next, rejected: [...rejected] }
     writeNamespaced(scopePath(target), merged)
     config = merged
+    // The ZDR catalog hides excluded models, so re-publish it after a change.
+    setCommandCodeZdrExcluded(merged.exclusions)
+    republishCommandCodeZdr()
   }
 
   function commandCodeModels(ctx: ExtensionContext): { id: string; name: string }[] {
@@ -431,7 +458,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     armed = true
     armedSource = source
     publishDecider()
-    updateStatus(ctx)
+    void applyProviderForArmed(ctx)
     ctx.ui.notify(
       `ZDR armed (${source}${detail ? `: ${detail}` : ""}). Protected data was touched, so requests now require zero data retention.`,
       "info",
@@ -443,7 +470,6 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     armedSource = undefined
     delete process.env[ARMED_ENV]
     publishDecider()
-    updateStatus()
   }
 
   /**
@@ -489,7 +515,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
       delete process.env[ARMED_ENV]
     }
     publishDecider()
-    updateStatus(ctx)
+    void applyProviderForArmed(ctx)
   }
 
   /**
@@ -556,13 +582,18 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     recomputeArmed(ctx)
   })
 
+  // Keep the provider aligned when the model changes, e.g. the user picks
+  // another Command Code model while armed.
+  pi.on("model_select", async (_event, ctx) => {
+    await applyProviderForArmed(ctx)
+  })
+
   pi.on("session_before_switch", async () => {
     disarm()
   })
 
-  pi.on("session_shutdown", async (_event, ctx) => {
+  pi.on("session_shutdown", async () => {
     disarm()
-    ctx.ui.setStatus(STATUS_KEY, undefined)
     setCommandCodeZdrDecider(undefined)
   })
 
@@ -771,7 +802,11 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     const message = event.message
     if (message.role !== "assistant") return
 
-    if (message.provider !== PROVIDER || message.stopReason !== "error" || !message.errorMessage)
+    if (
+      !isCommandCodeProvider(message.provider) ||
+      message.stopReason !== "error" ||
+      !message.errorMessage
+    )
       return
 
     const error = message.errorMessage
@@ -819,7 +854,6 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
       const apply = (next: ZdrConfig) => {
         current = next
         saveConfig(next)
-        updateStatus(ctx)
       }
 
       await ctx.ui.custom((tui, theme, _keybindings, done) => {

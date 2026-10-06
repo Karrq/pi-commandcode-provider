@@ -8,7 +8,14 @@
 import assert from "node:assert/strict"
 import { describe, it } from "node:test"
 
-import { commandCodeZdrFor, setCommandCodeZdrDecider } from "../src/zdr-state.ts"
+import {
+  commandCodeZdrExcluded,
+  commandCodeZdrFor,
+  republishCommandCodeZdr,
+  setCommandCodeZdrExcluded,
+  setCommandCodeZdrDecider,
+  setCommandCodeZdrRepublish,
+} from "../src/zdr-state.ts"
 
 describe("commandCodeZdrFor", () => {
   it("falls back to CMD_ZDR and COMMANDCODE_ZDR when no decider is published", () => {
@@ -32,5 +39,32 @@ describe("commandCodeZdrFor", () => {
     assert.equal(commandCodeZdrFor("a", { CMD_ZDR: "1" }), false)
     setCommandCodeZdrDecider(undefined)
     assert.equal(commandCodeZdrFor("a", { CMD_ZDR: "1" }), true)
+  })
+})
+
+describe("commandCodeZdrExcluded", () => {
+  it("hides only the published ids and clears with an empty list", () => {
+    setCommandCodeZdrExcluded(["a", "b"])
+    assert.equal(commandCodeZdrExcluded("a"), true)
+    assert.equal(commandCodeZdrExcluded("b"), true)
+    assert.equal(commandCodeZdrExcluded("c"), false)
+    setCommandCodeZdrExcluded([])
+    assert.equal(commandCodeZdrExcluded("a"), false)
+    setCommandCodeZdrExcluded(undefined)
+    assert.equal(commandCodeZdrExcluded("a"), false)
+  })
+})
+
+describe("republishCommandCodeZdr", () => {
+  it("calls the registered callback and stops after it is cleared", () => {
+    let calls = 0
+    setCommandCodeZdrRepublish(() => {
+      calls++
+    })
+    republishCommandCodeZdr()
+    assert.equal(calls, 1)
+    setCommandCodeZdrRepublish(undefined)
+    republishCommandCodeZdr()
+    assert.equal(calls, 1)
   })
 })

@@ -5,13 +5,14 @@
  * https://api.commandcode.ai/provider/v1
  */
 
-import { AssistantMessageEventStream } from "@earendil-works/pi-ai"
+import { AssistantMessageEventStream, type Provider } from "@earendil-works/pi-ai"
 import * as piAiCompat from "@earendil-works/pi-ai/compat"
 import { streamSimple as streamNativeProvider } from "@earendil-works/pi-ai/compat"
 import {
   getAgentDir,
   type ExtensionAPI,
   type ExtensionCommandContext,
+  type ExtensionContext,
   type ProviderConfig,
 } from "@earendil-works/pi-coding-agent"
 import { Text } from "@earendil-works/pi-tui"
@@ -43,12 +44,24 @@ import { formatQuota } from "./src/quota-format.ts"
 import type { CommandCodeQuota } from "./src/quota-types.ts"
 import { createCommandCodeRuntime } from "./src/runtime.ts"
 import { createCommandCodeUsageProvider, type UsageProvider } from "./src/usage.ts"
+import {
+  COMMAND_CODE_PROVIDER,
+  COMMAND_CODE_ZDR_PROVIDER,
+  isCommandCodeProvider,
+} from "./src/providers.ts"
 import { transcriptReadersFrom, withTranscriptPromptAndTools } from "./src/transcript.ts"
 import { createCommandCodeTransportRouter } from "./src/transport.ts"
-import { commandCodeZdrFor } from "./src/zdr-state.ts"
+import {
+  commandCodeZdrExcluded,
+  commandCodeZdrFor,
+  resolveCommandCodeZdrKey,
+  setCommandCodeZdrKeyResolver,
+  setCommandCodeZdrRepublish,
+} from "./src/zdr-state.ts"
 
 const COMMAND_CODE_API = "commandcode-custom"
 const COMPAT_SOURCE_ID = "pi-commandcode-provider"
+const ZDR_PROVIDER_NAME = "Command Code (ZDR)"
 
 type CompatStreamFunction = (
   model: Parameters<typeof streamNativeProvider>[0],
@@ -163,12 +176,77 @@ function createProviderConfig(
 }
 
 export default async function (pi: ExtensionAPI) {
+  /** The live ZDR provider, so a republish can re-register the same object. */
+  let zdrProvider: Provider | undefined
+  /** Last session context, for (re)registering the ZDR provider. */
+  let lastCtx: ExtensionContext | undefined
+
+  /**
+   * Register the ZDR provider, mirroring the `commandcode` catalog with zero
+   * data retention always on.
+   *
+   * The stream functions come from the composed `commandcode` provider, but the
+   * auth is ours: the ZDR provider has no credential of its own, so it resolves
+   * through the `commandcode` credential, which pi refreshes when the OAuth
+   * token expires. `getModels` reads the live `commandcode` catalog on every
+   * call, so a model catalog refresh updates both providers at once, and it
+   * drops the models the ZDR policy excludes so they cannot be selected under
+   * ZDR.
+   */
+  function registerZdrProvider(ctx: ExtensionContext): void {
+    lastCtx = ctx
+    const registry = ctx.modelRegistry
+    const base = registry.getProvider(COMMAND_CODE_PROVIDER)
+    if (!base) return
+    setCommandCodeZdrKeyResolver(() => registry.getApiKeyForProvider(COMMAND_CODE_PROVIDER))
+    const readModels = () => {
+      const live = registry.getProvider(COMMAND_CODE_PROVIDER)
+      if (!live) return []
+      return live
+        .getModels()
+        .filter((model) => !commandCodeZdrExcluded(model.id))
+        .map((model) => ({ ...model, provider: COMMAND_CODE_ZDR_PROVIDER }))
+    }
+    const provider: Provider = {
+      ...base,
+      id: COMMAND_CODE_ZDR_PROVIDER,
+      name: ZDR_PROVIDER_NAME,
+      auth: {
+        apiKey: {
+          name: "Command Code credential",
+          resolve: async () => {
+            const apiKey = await resolveCommandCodeZdrKey()
+            return apiKey ? { auth: { apiKey }, source: "commandcode credential" } : undefined
+          },
+          check: async () => {
+            const apiKey = await resolveCommandCodeZdrKey()
+            return apiKey ? { type: "api_key", source: "commandcode credential" } : undefined
+          },
+        },
+      },
+      getModels: readModels,
+      getAllModels: readModels,
+      // The catalog is read live, so this provider has nothing to refresh.
+      refreshModels: async () => {},
+    }
+    zdrProvider = provider
+    pi.registerProvider(provider)
+  }
+
+  /** Re-register the ZDR provider so its catalog picks up new exclusions. */
+  setCommandCodeZdrRepublish(() => {
+    if (zdrProvider) pi.registerProvider(zdrProvider)
+    else if (lastCtx) registerZdrProvider(lastCtx)
+  })
+
   // Hosts may select their built-in Command Code model before loading extensions.
   // Rebind that stale selection to our registered transport before the first turn.
   pi.on("session_start", async (_event, ctx) => {
-    if (ctx.model?.provider !== "commandcode") return
-    const registered = ctx.modelRegistry.find("commandcode", ctx.model.id)
-    if (registered?.api === COMMAND_CODE_API && ctx.model.api !== COMMAND_CODE_API) {
+    registerZdrProvider(ctx)
+    const model = ctx.model
+    if (!model || !isCommandCodeProvider(model.provider)) return
+    const registered = ctx.modelRegistry.find(COMMAND_CODE_PROVIDER, model.id)
+    if (registered?.api === COMMAND_CODE_API && model.api !== COMMAND_CODE_API) {
       await pi.setModel(registered)
     }
   })
@@ -189,11 +267,13 @@ export default async function (pi: ExtensionAPI) {
   // not run pi's `before_provider_headers` hook, so this is the one place that
   // can make them honor the commandcode-zdr policy.
   const withZdrHeaders = (
-    model: { id: string },
+    model: { id: string; provider?: string },
     options?: Parameters<typeof streamNativeProvider>[2],
   ) => {
     const headers = { ...(options?.headers ?? {}) }
-    if (commandCodeZdrFor(model.id)) headers["x-cmd-zdr"] = "1"
+    // The ZDR provider always sends the header; the plain provider follows the policy.
+    if (model.provider === COMMAND_CODE_ZDR_PROVIDER || commandCodeZdrFor(model.id))
+      headers["x-cmd-zdr"] = "1"
     else delete headers["x-cmd-zdr"]
     return { ...options, headers }
   }
