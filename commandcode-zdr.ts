@@ -92,6 +92,8 @@ const JEV_CACHE_TTL_MS = 60_000
 const DEFAULT_JEV_MIN_CONFIDENCE = 0.6
 /** Session entry recording one Jev consult about a shell command. Data-only. */
 const ZDR_JEV_ENTRY = "commandcode-zdr.jev"
+/** Footer status key; pi renders it on the extension-status line. */
+const STATUS_KEY = "zdr"
 
 /** Tool input field that carries a path, for the tools that read one directly. */
 const READ_TOOL_PATH: Record<string, string> = {
@@ -313,8 +315,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
   /** Normalized zones for the current cwd. */
   let zones: string[] = []
   /** Recent Jev answers, keyed by command, so repeated calls do not re-classify. */
-  const jevCache = new Map<string, { at: number; probability: number }>()
-  /**
+  const jevCache = new Map<string, { at: number; probability: number }>() /**
    * Session escape hatch chosen at the Jev prompt: zone reads no longer arm ZDR
    * for the rest of the session. In memory only; a reload starts guarded again.
    */
@@ -347,6 +348,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
       .filter((zone): zone is string => zone !== undefined)
     scope = project ? "project" : "global"
     publishDecider()
+    updateStatus(ctx)
   }
 
   /**
@@ -357,6 +359,25 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
    */
   function publishDecider(): void {
     setCommandCodeZdrDecider(config || armed ? (modelId) => sendZdrFor(modelId) : undefined)
+  }
+
+  /** Last UI-bearing context, so the badge can be cleared from a helper without one. */
+  let statusCtx: ExtensionContext | undefined
+
+  /**
+   * Footer badge for what the next Command Code request will do: `armed` when a
+   * protected zone was touched, `on` when enforcement is enabled, and nothing
+   * when ZDR is off. pi renders extension statuses on their own footer line; it
+   * has no inline slot next to the model name.
+   */
+  function updateStatus(ctx?: ExtensionContext): void {
+    if (ctx) statusCtx = ctx
+    const target = statusCtx
+    if (!target?.hasUI) return
+    target.ui.setStatus(
+      STATUS_KEY,
+      armed ? "[ZDR] armed" : config?.enabled ? "[ZDR] on" : undefined,
+    )
   }
 
   function scopePath(target: ZdrScope): string {
@@ -410,6 +431,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     armed = true
     armedSource = source
     publishDecider()
+    updateStatus(ctx)
     ctx.ui.notify(
       `ZDR armed (${source}${detail ? `: ${detail}` : ""}). Protected data was touched, so requests now require zero data retention.`,
       "info",
@@ -421,6 +443,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     armedSource = undefined
     delete process.env[ARMED_ENV]
     publishDecider()
+    updateStatus()
   }
 
   /**
@@ -466,6 +489,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
       delete process.env[ARMED_ENV]
     }
     publishDecider()
+    updateStatus(ctx)
   }
 
   /**
@@ -536,8 +560,9 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     disarm()
   })
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (_event, ctx) => {
     disarm()
+    ctx.ui.setStatus(STATUS_KEY, undefined)
     setCommandCodeZdrDecider(undefined)
   })
 
@@ -794,6 +819,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
       const apply = (next: ZdrConfig) => {
         current = next
         saveConfig(next)
+        updateStatus(ctx)
       }
 
       await ctx.ui.custom((tui, theme, _keybindings, done) => {
