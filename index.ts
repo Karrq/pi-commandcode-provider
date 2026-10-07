@@ -283,9 +283,9 @@ export default async function (pi: ExtensionAPI) {
     options?: Parameters<typeof streamNativeProvider>[2],
   ) => {
     const headers = { ...(options?.headers ?? {}) }
-    // The ZDR provider always sends the header; the plain provider follows the policy.
-    if (model.provider === COMMAND_CODE_ZDR_PROVIDER || commandCodeZdrFor(model.id))
-      headers["x-cmd-zdr"] = "1"
+    // The provider is the ZDR mode: the decider is asked with the provider and
+    // owns every override (exclusions, releases, the environment force).
+    if (commandCodeZdrFor(model.id, model.provider)) headers["x-cmd-zdr"] = "1"
     else delete headers["x-cmd-zdr"]
     return { ...options, headers }
   }

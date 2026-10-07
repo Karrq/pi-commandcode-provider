@@ -16,29 +16,34 @@ import {
   setCommandCodeZdrDecider,
   setCommandCodeZdrRepublish,
 } from "../src/zdr-state.ts"
+import { COMMAND_CODE_ZDR_PROVIDER } from "../src/providers.ts"
 
 describe("commandCodeZdrFor", () => {
-  it("falls back to CMD_ZDR and COMMANDCODE_ZDR when no decider is published", () => {
+  it("falls back to the environment and the ZDR provider when no decider is published", () => {
     setCommandCodeZdrDecider(undefined)
-    assert.equal(commandCodeZdrFor("m", { CMD_ZDR: "1" }), true)
-    assert.equal(commandCodeZdrFor("m", { COMMANDCODE_ZDR: "1" }), true)
-    assert.equal(commandCodeZdrFor("m", {}), false)
+    assert.equal(commandCodeZdrFor("m", undefined, { CMD_ZDR: "1" }), true)
+    assert.equal(commandCodeZdrFor("m", undefined, { COMMANDCODE_ZDR: "1" }), true)
+    assert.equal(commandCodeZdrFor("m", undefined, {}), false)
+    // The ZDR provider is the mode, even with no environment force.
+    assert.equal(commandCodeZdrFor("m", COMMAND_CODE_ZDR_PROVIDER, {}), true)
+    assert.equal(commandCodeZdrFor("m", "commandcode", {}), false)
     // Only the exact "1" value enables the header.
-    assert.equal(commandCodeZdrFor("m", { CMD_ZDR: "true" }), false)
+    assert.equal(commandCodeZdrFor("m", undefined, { CMD_ZDR: "true" }), false)
   })
 
-  it("lets a published decider override the environment per model", () => {
-    setCommandCodeZdrDecider((modelId) => modelId === "a")
-    assert.equal(commandCodeZdrFor("a", { CMD_ZDR: "1" }), true)
-    assert.equal(commandCodeZdrFor("b", { CMD_ZDR: "1" }), false)
+  it("lets a published decider override the environment per model and provider", () => {
+    setCommandCodeZdrDecider((modelId, provider) => modelId === "a" && provider === "zdr")
+    assert.equal(commandCodeZdrFor("a", "zdr", { CMD_ZDR: "1" }), true)
+    assert.equal(commandCodeZdrFor("b", "zdr", { CMD_ZDR: "1" }), false)
+    assert.equal(commandCodeZdrFor("a", "plain", { CMD_ZDR: "1" }), false)
     setCommandCodeZdrDecider(undefined)
   })
 
   it("restores the environment fallback after the decider is cleared", () => {
     setCommandCodeZdrDecider(() => false)
-    assert.equal(commandCodeZdrFor("a", { CMD_ZDR: "1" }), false)
+    assert.equal(commandCodeZdrFor("a", undefined, { CMD_ZDR: "1" }), false)
     setCommandCodeZdrDecider(undefined)
-    assert.equal(commandCodeZdrFor("a", { CMD_ZDR: "1" }), true)
+    assert.equal(commandCodeZdrFor("a", undefined, { CMD_ZDR: "1" }), true)
   })
 })
 

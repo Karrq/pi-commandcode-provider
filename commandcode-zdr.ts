@@ -17,8 +17,7 @@
  *   - project: <cwd>/.pi/settings.json, read only when the project is trusted,
  *     and overriding the global namespace field by field
  *
- * Three settings:
- *   - enforcement: on / off
+ * Two settings:
  *   - exclusions:  model ids that never receive the header
  *   - on 422:      ask / fallback / block
  * plus `zones` and its Jev settings; see below.
@@ -26,17 +25,17 @@
  * ZDR zones: a zone is a folder whose content must never reach a model
  * without zero-data-retention. A zone may use `*`, `?` and `**` glob wildcards,
  * so `~/Altius-*` covers every sibling directory with that prefix. When a tool
- * touches one, the session becomes
- * "armed": every later request carries x-cmd-zdr: 1 no matter what enabled,
- * exclusions, or rejected say (armed wins). Arming is only active while the
- * session's provider is Command Code; on any other provider the header is never
- * sent and the provider is never switched, so zone touches do not mark the
- * session. Arming is written as a `commandcode-zdr.armed` session entry,
- * rendered in the transcript at the point it happened, and recomputed from the
- * current branch, so navigating to a branch that never touched a zone disarms.
- * While armed the session is moved to the `commandcode-zdr` provider, the same
- * catalog with zero data retention always on, so the footer and the worker
- * agent loops follow the decision; disarming moves it back.
+ * touches one, the session becomes "armed": it is moved to the
+ * `commandcode-zdr` provider, the same catalog with zero data retention always
+ * on, which is the ZDR mode. Arming is only active while the session's provider
+ * is Command Code; on any other provider the header is never sent and the
+ * provider is never switched, so zone touches do not mark the session. Arming
+ * is written as a `commandcode-zdr.armed`
+ * session entry, rendered in the transcript at the point it happened, and
+ * recomputed from the current branch, so navigating to a
+ * branch that never touched a zone disarms. The switch is applied when the
+ * session arms and on session events; it only moves toward ZDR, so picking
+ * another provider afterwards is a real override that sticks.
  * `COMMANDCODE_ZDR_ARMED` is mirrored in the environment while armed so
  * spawned subagents inherit it. Shell commands the textual path check misses
  * are sent to the pi-jev classifier provider `local-jev`; a near-0.5 result
@@ -95,6 +94,7 @@ import {
   normalizeZone,
   pathInZones,
 } from "./src/zdr-zones.ts"
+import { zdrHeaderFor } from "./src/zdr-policy.ts"
 
 const PROVIDER = COMMAND_CODE_PROVIDER
 const ZDR_PROVIDER = COMMAND_CODE_ZDR_PROVIDER
@@ -147,7 +147,6 @@ interface JevRecord {
 }
 
 interface ZdrConfig {
-  enabled: boolean
   exclusions: string[]
   onUnsupported: Policy
   /**
@@ -170,7 +169,6 @@ interface ZdrConfig {
 
 /** A config file as written: every field optional so scopes can merge. */
 interface ZdrConfigFile {
-  enabled?: boolean
   exclusions?: string[]
   onUnsupported?: Policy
   rejected?: string[]
@@ -183,7 +181,6 @@ interface ZdrConfigFile {
 const POLICIES: Policy[] = ["ask", "fallback", "block"]
 
 const DEFAULT_CONFIG: ZdrConfig = {
-  enabled: true,
   exclusions: [],
   onUnsupported: "ask",
   rejected: [],
@@ -208,7 +205,6 @@ function parseConfigObject(value: unknown): ZdrConfigFile | null {
   if (typeof value !== "object" || value === null) return null
   const candidate = value as Partial<ZdrConfigFile>
   const file: ZdrConfigFile = {}
-  if (typeof candidate.enabled === "boolean") file.enabled = candidate.enabled
   if (isPolicy(candidate.onUnsupported)) file.onUnsupported = candidate.onUnsupported
   if (candidate.exclusions !== undefined) file.exclusions = stringList(candidate.exclusions)
   if (candidate.rejected !== undefined) file.rejected = stringList(candidate.rejected)
@@ -293,7 +289,6 @@ function mergeConfigFiles(
 ): ZdrConfig | null {
   if (!global && !project) return null
   return {
-    enabled: project?.enabled ?? global?.enabled ?? DEFAULT_CONFIG.enabled,
     exclusions: project?.exclusions ?? global?.exclusions ?? [],
     onUnsupported: project?.onUnsupported ?? global?.onUnsupported ?? DEFAULT_CONFIG.onUnsupported,
     rejected: [...new Set([...(global?.rejected ?? []), ...(project?.rejected ?? [])])],
@@ -399,29 +394,32 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
   /**
    * Publish the header decision to the provider transport, the only path every
    * request takes (including worker agent loops that never run pi's header
-   * hook). A missing namespace and no arming leaves it to the CMD_ZDR
-   * environment. Arming keeps a decider alive even without saved settings.
+   * hook). The provider is the ZDR mode, so the decider is always published;
+   * the environment force and the per-model releases are handled inside it.
    */
   function publishDecider(): void {
-    setCommandCodeZdrDecider(config || armed ? (modelId) => sendZdrFor(modelId) : undefined)
+    setCommandCodeZdrDecider((modelId, provider) => sendZdrFor(modelId, provider))
   }
 
-  /** Guard so a provider switch does not re-enter through its own model_select. */
+  /** Guard so a provider switch does not re-enter while it is in flight. */
   let switching = false
 
   /**
-   * Move the session onto the provider that matches the armed state: the ZDR
-   * provider while armed, the plain one otherwise, keeping the model id. Models
-   * the ZDR policy excludes are absent from the ZDR catalog, so an armed session
-   * stays on the plain provider for them.
+   * Move the session onto the ZDR provider when armed, keeping the model id.
+   * The provider is the ZDR mode, so this switch is what enforces arming.
+   *
+   * It only moves toward ZDR: it never forces a session back to the plain
+   * provider, so picking another provider after arming is a real override that
+   * sticks. Models the ZDR policy excludes are absent from the ZDR catalog, so
+   * an armed session stays on the plain provider for them. A failed switch
+   * leaves the decision to the transport, which follows the provider.
    */
   async function applyProviderForArmed(ctx: ExtensionContext): Promise<void> {
+    if (!armed) return
     const model = ctx.model
     if (!model || switching) return
-    const wanted = armed ? ZDR_PROVIDER : PROVIDER
-    const current = armed ? PROVIDER : ZDR_PROVIDER
-    if (model.provider !== current) return
-    const target = ctx.modelRegistry.find(wanted, model.id)
+    if (model.provider !== PROVIDER) return
+    const target = ctx.modelRegistry.find(ZDR_PROVIDER, model.id)
     if (!target) return
     switching = true
     try {
@@ -432,7 +430,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
         await new Promise((resolve) => setTimeout(resolve, 150))
       }
     } catch {
-      // A failed switch is cosmetic: arming still forces the header in the transport.
+      // A failed switch leaves the provider decision to the transport.
     } finally {
       switching = false
     }
@@ -470,16 +468,17 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     }
   }
 
-  /** Whether the next request for this model carries the header. Consumes a one-shot release. */
-  function sendZdrFor(modelId: string): boolean {
-    // Armed wins over enabled, exclusions, rejected, sessionAllow, and onceAllow.
-    if (armed) return true
-    if (!config || !config.enabled) return false
-    if (onceAllow.delete(modelId)) return false
-    if (config.exclusions.includes(modelId)) return false
-    if (sessionAllow.has(modelId)) return false
-    if (rejected.has(modelId)) return false
-    return true
+  /**
+   * Whether the next request for this model carries the header. Consumes a
+   * one-shot release. The provider is the mode; exclusions and releases veto it.
+   */
+  function sendZdrFor(modelId: string, provider?: string): boolean {
+    return zdrHeaderFor(modelId, provider, {
+      exclusions: config?.exclusions ?? [],
+      sessionAllow,
+      rejected,
+      onceAllow,
+    })
   }
 
   /**
@@ -581,7 +580,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
 
     if (armed) {
       ctx.ui.notify(
-        `${reason} ZDR is armed because protected data was read, and fallback is disabled while armed. Use /commandcode:zdr to turn enforcement off if that data is no longer in context.`,
+        `${reason} ZDR is armed because protected data was read, and fallback is disabled while armed. Pick a plain commandcode model to continue without ZDR if that data is no longer in context.`,
         "error",
       )
       return false
@@ -630,12 +629,6 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
   pi.on("session_tree", async (_event, ctx) => {
     // The branch changed, so arming may have been added or left behind.
     recomputeArmed(ctx)
-  })
-
-  // Keep the provider aligned when the model changes, e.g. the user picks
-  // another Command Code model while armed.
-  pi.on("model_select", async (_event, ctx) => {
-    await applyProviderForArmed(ctx)
   })
 
   pi.on("session_before_switch", async () => {
@@ -738,12 +731,12 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     } else {
       try {
         const result = await ctx.modelRegistry.classify(models[0], {
-          state: { cwd, command, zones },
+          state: { protected_directories: zones, cwd, shell_command: command },
           questions: {
             reads_zone: {
               type: "bool",
               instructions:
-                "Could running this shell command read, print, copy, encode, or transmit the contents of a file inside one of the protected directories? Consider variables, concatenation, quoting, globs, subshells, interpreters, scripts, and symlinks.",
+                "Could running this shell command read, print, copy, encode, or transmit the contents of a file inside a protected directory? Consider variables, concatenation, quoting, globs, subshells, interpreters, scripts, and symlinks.",
               criteria: {
                 true: "It could reach protected content",
                 false: "It cannot reach protected content",
@@ -765,7 +758,9 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     }
 
     const confidence = probability === undefined ? undefined : Math.abs(probability - 0.5) * 2
-    if (probability !== undefined) {
+    // Only a confident answer decides on its own. A low-confidence answer, even
+    // one above 0.5, falls through to the prompt so the user can skip arming.
+    if (probability !== undefined && (confidence ?? 0) >= min) {
       if (probability >= 0.5) {
         arm(ctx, "jev", command)
         recordJev(ctx, {
@@ -777,17 +772,15 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
         })
         return
       }
-      if ((confidence ?? 0) >= min) {
-        recordJev(ctx, {
-          command,
-          source,
-          verdict: "skipped",
-          probability,
-          confidence,
-          elapsedMs: Date.now() - started,
-        })
-        return
-      }
+      recordJev(ctx, {
+        command,
+        source,
+        verdict: "skipped",
+        probability,
+        confidence,
+        elapsedMs: Date.now() - started,
+      })
+      return
     }
 
     const detail =
@@ -866,11 +859,14 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
 
     if (EMPTY_RESPONSE.test(error)) return retryable
 
-    // The transport owns the header decision, so a rejection is any error from
-    // an enabled policy. The model id comes from the message that failed.
+    // The transport owns the header decision, so a rejection is any error while
+    // the session sends the header. The model id comes from the message that
+    // failed.
     const modelId = (message as { model?: string }).model ?? ctx.model?.id
-    if (!config || !modelId || !ZDR_REJECTION.test(error)) return
-    return (await resolveRejection(ctx, config, modelId)) ? retryable : undefined
+    // A session can be on the ZDR provider before any settings namespace exists,
+    // so use the defaults instead of skipping rejection handling entirely.
+    if (!modelId || !ZDR_REJECTION.test(error)) return
+    return (await resolveRejection(ctx, config ?? DEFAULT_CONFIG, modelId)) ? retryable : undefined
   })
 
   /** Modal model picker used by the "+ exclude a model" row. */
@@ -962,17 +958,10 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
             id: "armed",
             label: "Zone enforcement",
             description: armed
-              ? `Armed by ${armedSource ?? "a zone read"}; requests require zero data retention.`
+              ? `Armed by ${armedSource ?? "a zone read"}; the session was moved to the commandcode-zdr provider.`
               : "Not armed. No ZDR-zone data has been touched this session.",
             currentValue: armed ? "armed" : "idle",
             values: [armed ? "armed" : "idle"],
-          },
-          {
-            id: "enabled",
-            label: "ZDR enforcement",
-            description: "on: send x-cmd-zdr: 1 on Command Code requests that are not excluded.",
-            currentValue: current.enabled ? "on" : "off",
-            values: ["on", "off"],
           },
           {
             id: "onUnsupported",
@@ -1039,10 +1028,6 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
               apply({ ...current, zonesJevRecord: newValue === "on" })
               return
             }
-            if (id === "enabled") {
-              apply({ ...current, enabled: newValue === "on" })
-              return
-            }
             if (id === "onUnsupported") {
               if (isPolicy(newValue)) apply({ ...current, onUnsupported: newValue })
               return
@@ -1104,9 +1089,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
       })
 
       ctx.ui.notify(
-        current.enabled
-          ? `ZDR on for ${scope}, ${current.exclusions.length} model(s) excluded, ${zones.length} zone(s)`
-          : `ZDR off for ${scope}, ${zones.length} zone(s)`,
+        `ZDR policy saved to ${scope}: ${current.exclusions.length} model(s) excluded, ${zones.length} zone(s). ZDR runs on the commandcode-zdr provider.`,
         "info",
       )
     },

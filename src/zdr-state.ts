@@ -9,9 +9,10 @@
  * request is built.
  *
  * The `commandcode-zdr` extension publishes a decider here and owns the
- * policy (enabled, exclusions, learned rejections). When nothing publishes
- * one, the CMD_ZDR / COMMANDCODE_ZDR environment fallback applies, so the
- * provider keeps working without the extension.
+ * per-model policy (exclusions, session releases, learned rejections). When
+ * nothing publishes one, the environment fallback applies and the ZDR provider
+ * still sends the header on its own, so the provider keeps working without the
+ * extension.
  *
  * The same extension also publishes the excluded model ids and a "republish"
  * callback here. The provider entry uses the ids to hide those models from the
@@ -26,12 +27,14 @@
  * them as separate module instances.
  */
 
+import { COMMAND_CODE_ZDR_PROVIDER } from "./providers.ts"
+
 const DECIDER_KEY = Symbol.for("pi-commandcode-provider.zdr-decider")
 const EXCLUDED_KEY = Symbol.for("pi-commandcode-provider.zdr-excluded")
 const REPUBLISH_KEY = Symbol.for("pi-commandcode-provider.zdr-republish")
 const KEY_RESOLVER_KEY = Symbol.for("pi-commandcode-provider.zdr-key-resolver")
 
-type ZdrDecider = (modelId: string) => boolean
+type ZdrDecider = (modelId: string, provider?: string) => boolean
 type ZdrKeyResolver = () => Promise<string | undefined>
 
 /** Publish the per-model header decision, or clear it to fall back to the environment. */
@@ -40,11 +43,23 @@ export function setCommandCodeZdrDecider(decider: ZdrDecider | undefined): void 
   else delete (globalThis as Record<symbol, unknown>)[DECIDER_KEY]
 }
 
-/** Whether this model's request carries `x-cmd-zdr: 1`. */
-export function commandCodeZdrFor(modelId: string, env: NodeJS.ProcessEnv = process.env): boolean {
+/**
+ * Whether this model's request carries `x-cmd-zdr: 1`.
+ *
+ * The published decider is authoritative and receives the provider, since the
+ * provider is the ZDR mode. With no decider the ZDR provider still sends the
+ * header on its own, so the provider works when the policy extension is not
+ * loaded; the environment flags force it on the plain provider.
+ */
+export function commandCodeZdrFor(
+  modelId: string,
+  provider?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
   const decider = (globalThis as Record<symbol, unknown>)[DECIDER_KEY]
-  if (typeof decider === "function") return (decider as ZdrDecider)(modelId)
-  return env.CMD_ZDR === "1" || env.COMMANDCODE_ZDR === "1"
+  if (typeof decider === "function") return (decider as ZdrDecider)(modelId, provider)
+  if (env.CMD_ZDR === "1" || env.COMMANDCODE_ZDR === "1") return true
+  return provider === COMMAND_CODE_ZDR_PROVIDER
 }
 
 /** Publish the model ids the ZDR provider catalog must not offer. */

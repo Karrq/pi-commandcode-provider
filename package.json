@@ -31,7 +31,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "npm run typecheck && node --test tests/test-release.mjs && tsx tests/test-package-manifest.ts && tsx tests/test-api-key.ts && tsx tests/test-pure-functions.ts && tsx tests/test-models.ts && tsx tests/test-model-metadata-check.ts && tsx tests/test-runtime.ts && tsx tests/test-pricing.ts && tsx tests/test-cost.ts && tsx tests/test-oauth.ts && tsx tests/test-abort.ts && tsx tests/test-overflow.ts && tsx tests/test-stream.ts && tsx tests/test-quota.ts && tsx tests/test-quota-command.ts && tsx tests/test-usage.ts && tsx tests/test-usage-widget.ts && tsx tests/test-zdr-state.ts && tsx tests/test-zdr-zones.ts && tsx tests/test-retry.ts && tsx tests/test-transport.ts && node tests/test-pi-isolated.mjs && node tests/test-pi-authenticated.mjs && node tests/test-pi-local.mjs && node tests/test-omp-compat.mjs",
+    "test": "npm run typecheck && node --test tests/test-release.mjs && tsx tests/test-package-manifest.ts && tsx tests/test-api-key.ts && tsx tests/test-pure-functions.ts && tsx tests/test-models.ts && tsx tests/test-model-metadata-check.ts && tsx tests/test-runtime.ts && tsx tests/test-pricing.ts && tsx tests/test-cost.ts && tsx tests/test-oauth.ts && tsx tests/test-abort.ts && tsx tests/test-overflow.ts && tsx tests/test-stream.ts && tsx tests/test-quota.ts && tsx tests/test-quota-command.ts && tsx tests/test-usage.ts && tsx tests/test-usage-widget.ts && tsx tests/test-zdr-state.ts && tsx tests/test-zdr-zones.ts && tsx tests/test-zdr-policy.ts && tsx tests/test-retry.ts && tsx tests/test-transport.ts && node tests/test-pi-isolated.mjs && node tests/test-pi-authenticated.mjs && node tests/test-pi-local.mjs && node tests/test-omp-compat.mjs",
     "typecheck": "tsc --noEmit",
     "format:check": "prettier --check '**/*.{ts,mjs,json,md}'",
     "format": "prettier --write '**/*.{ts,mjs,json,md}'",
@@ -43,8 +43,9 @@
     "test:usage": "tsx tests/test-usage.ts",
     "test:usage-widget": "tsx tests/test-usage-widget.ts",
     "test:zdr": "tsx tests/test-zdr-state.ts",
+    "test:zdr-policy": "tsx tests/test-zdr-policy.ts",
     "test:zdr-zones": "tsx tests/test-zdr-zones.ts",
-    "test:unit": "tsx tests/test-api-key.ts && tsx tests/test-pure-functions.ts && tsx tests/test-models.ts && tsx tests/test-model-metadata-check.ts && tsx tests/test-runtime.ts && tsx tests/test-pricing.ts && tsx tests/test-cost.ts && tsx tests/test-oauth.ts && tsx tests/test-abort.ts && tsx tests/test-overflow.ts && tsx tests/test-stream.ts && tsx tests/test-quota.ts && tsx tests/test-quota-command.ts && tsx tests/test-usage.ts && tsx tests/test-usage-widget.ts && tsx tests/test-zdr-state.ts && tsx tests/test-zdr-zones.ts && tsx tests/test-retry.ts && tsx tests/test-transport.ts",
+    "test:unit": "tsx tests/test-api-key.ts && tsx tests/test-pure-functions.ts && tsx tests/test-models.ts && tsx tests/test-model-metadata-check.ts && tsx tests/test-runtime.ts && tsx tests/test-pricing.ts && tsx tests/test-cost.ts && tsx tests/test-oauth.ts && tsx tests/test-abort.ts && tsx tests/test-overflow.ts && tsx tests/test-stream.ts && tsx tests/test-quota.ts && tsx tests/test-quota-command.ts && tsx tests/test-usage.ts && tsx tests/test-usage-widget.ts && tsx tests/test-zdr-state.ts && tsx tests/test-zdr-zones.ts && tsx tests/test-zdr-policy.ts && tsx tests/test-retry.ts && tsx tests/test-transport.ts",
     "test:api-key": "tsx tests/test-api-key.ts",
     "test:models": "tsx tests/test-models.ts && tsx tests/test-model-metadata-check.ts",
     "test:runtime": "tsx tests/test-runtime.ts",
