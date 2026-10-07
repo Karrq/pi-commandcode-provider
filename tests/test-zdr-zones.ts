@@ -14,6 +14,7 @@ import {
   ZDR_ARMED_ENTRY,
   armedFromEntries,
   commandMentionsZone,
+  describeArmedMarker,
   formatZoneList,
   normalizeZone,
   pathInZones,
@@ -199,5 +200,18 @@ describe("formatZoneList", () => {
   it("joins zones with commas and renders an empty list as (none)", () => {
     assert.equal(formatZoneList(["/a", "~/b"]), "/a, ~/b")
     assert.equal(formatZoneList([]), "(none)")
+  })
+})
+
+describe("describeArmedMarker", () => {
+  it("names the source without a detail", () => {
+    assert.equal(describeArmedMarker({ at: 1, source: "cwd" }), "ZDR armed (cwd)")
+  })
+
+  it("appends the detail when present", () => {
+    assert.equal(
+      describeArmedMarker({ at: 1, source: "bash", detail: "cat ~/Altius/secret.env" }),
+      "ZDR armed (bash: cat ~/Altius/secret.env)",
+    )
   })
 })

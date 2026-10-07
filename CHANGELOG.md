@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Render the `commandcode-zdr.armed` session entry in the transcript, so a branch shows where ZDR was armed and by what, instead of only a notification and a provider switch.
+- Gate ZDR arming on the active provider: zone touches on a non-Command-Code provider (for example `claude-bridge`) no longer append an armed entry, set `COMMANDCODE_ZDR_ARMED`, or arm the session, since the header is only ever sent to Command Code.
+
 ## 0.7.3 - 2026-09-28
 
 - Register an Oh My Pi usage provider alongside the Command Code models, so OMP reports the account's 5-hour and weekly usage windows, credits remaining and used against the billing-period pool, and the current plan wherever it reads provider usage. The report is built from the same alpha endpoints and credentials `/commandcode-quota` uses rather than a second fetch, and sections the API does not report are listed as unavailable instead of being displayed as zero usage. pi has no `usage` field and ignores it ([#120](https://github.com/patlux/pi-commandcode-provider/pull/120)).

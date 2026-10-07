@@ -28,12 +28,15 @@
  * so `~/Altius-*` covers every sibling directory with that prefix. When a tool
  * touches one, the session becomes
  * "armed": every later request carries x-cmd-zdr: 1 no matter what enabled,
- * exclusions, or rejected say (armed wins). Arming is written as a
- * `commandcode-zdr.armed` session entry and recomputed from the current
- * branch, so navigating to a branch that never touched a zone disarms. While
- * armed the session is moved to the `commandcode-zdr` provider, the same catalog
- * with zero data retention always on, so the footer and the worker agent loops
- * follow the decision; disarming moves it back.
+ * exclusions, or rejected say (armed wins). Arming is only active while the
+ * session's provider is Command Code; on any other provider the header is never
+ * sent and the provider is never switched, so zone touches do not mark the
+ * session. Arming is written as a `commandcode-zdr.armed` session entry,
+ * rendered in the transcript at the point it happened, and recomputed from the
+ * current branch, so navigating to a branch that never touched a zone disarms.
+ * While armed the session is moved to the `commandcode-zdr` provider, the same
+ * catalog with zero data retention always on, so the footer and the worker
+ * agent loops follow the decision; disarming moves it back.
  * `COMMANDCODE_ZDR_ARMED` is mirrored in the environment while armed so
  * spawned subagents inherit it. Shell commands the textual path check misses
  * are sent to the pi-jev classifier provider `local-jev`; a near-0.5 result
@@ -71,7 +74,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
 import { getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent"
-import { Container, type SettingItem, SettingsList } from "@earendil-works/pi-tui"
+import { Box, Container, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui"
 import {
   COMMAND_CODE_PROVIDER,
   COMMAND_CODE_ZDR_PROVIDER,
@@ -87,6 +90,7 @@ import {
   type ArmedMarker,
   armedFromEntries,
   commandMentionsZone,
+  describeArmedMarker,
   formatZoneList,
   normalizeZone,
   pathInZones,
@@ -332,6 +336,36 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
    */
   let zoneGuardOff = false
 
+  // The armed marker is a data-only entry, so without a renderer it is invisible
+  // in the transcript. Render it in place so scrolling the branch shows exactly
+  // where ZDR was armed and why.
+  pi.registerEntryRenderer<ArmedMarker>(ZDR_ARMED_ENTRY, (entry, { expanded }, theme) => {
+    const marker = entry.data
+    if (!marker) return undefined
+    const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text))
+    const when = marker.at ? theme.fg("dim", ` ${new Date(marker.at).toLocaleString()}`) : ""
+    box.addChild(
+      new Text(
+        `${theme.fg("accent", "[zdr]")} ${theme.bold(describeArmedMarker(marker))}${when}`,
+        0,
+        0,
+      ),
+    )
+    if (expanded) {
+      box.addChild(
+        new Text(
+          theme.fg(
+            "dim",
+            "Protected data was touched, so requests on this branch require zero data retention.",
+          ),
+          0,
+          0,
+        ),
+      )
+    }
+    return box
+  })
+
   /**
    * Resolve the effective config for a session.
    *
@@ -448,8 +482,19 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     return true
   }
 
+  /**
+   * ZDR governs only Command Code requests. On any other provider the header is
+   * never sent and the provider is never switched, so arming has no effect.
+   * Keep the zone machinery dormant there instead of marking the session.
+   */
+  function zdrActiveFor(ctx: ExtensionContext): boolean {
+    return isCommandCodeProvider(ctx.model?.provider)
+  }
+
   /** Persist arming on the branch, mirror it into the environment, and notify once. */
   function arm(ctx: ExtensionContext, source: string, detail?: string): void {
+    // Nothing to arm on a provider ZDR does not govern.
+    if (!zdrActiveFor(ctx)) return
     // One marker per branch is enough to arm it; repeated touches only add noise.
     if (armed) return
     const marker: ArmedMarker = { at: Date.now(), source, ...(detail ? { detail } : {}) }
@@ -460,7 +505,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     publishDecider()
     void applyProviderForArmed(ctx)
     ctx.ui.notify(
-      `ZDR armed (${source}${detail ? `: ${detail}` : ""}). Protected data was touched, so requests now require zero data retention.`,
+      `${describeArmedMarker(marker)}. Protected data was touched, so requests now require zero data retention.`,
       "info",
     )
   }
@@ -494,6 +539,11 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
    * the cwd, or inherited from a parent) is persisted so it survives a reload.
    */
   function recomputeArmed(ctx: ExtensionContext): void {
+    // ZDR does not govern other providers, so never arm or stay armed there.
+    if (!zdrActiveFor(ctx)) {
+      disarm()
+      return
+    }
     // Zone checks were turned off for this session; do not arm on branch changes.
     if (zoneGuardOff) return
     const inherited = process.env[ARMED_ENV] === "1"
@@ -598,6 +648,8 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
   })
 
   pi.on("tool_call", async (event, ctx) => {
+    // Zone detection only matters where ZDR can be enforced.
+    if (!zdrActiveFor(ctx)) return
     // Nothing to detect without zones, with the session guard off, or when an
     // earlier read already armed the branch (the header is already on).
     if (zones.length === 0 || zoneGuardOff || armed) return

@@ -201,3 +201,12 @@ export function armedFromEntries(entries: readonly unknown[]): ArmedMarker | und
 export function formatZoneList(zones: readonly string[]): string {
   return zones.length === 0 ? "(none)" : zones.join(", ")
 }
+
+/**
+ * One-line summary of why a branch armed, without the trailing explanation.
+ * Shared by the arming notification and the session-entry renderer so both read
+ * the same.
+ */
+export function describeArmedMarker(marker: ArmedMarker): string {
+  return `ZDR armed (${marker.source}${marker.detail ? `: ${marker.detail}` : ""})`
+}
