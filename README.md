@@ -147,6 +147,17 @@ For vision-capable models, Pi's native provider adapters forward image blocks fr
 
 The legacy generate transport resolves image support from the host's `model.input` when the host supplies it, and falls back to the capability snapshot otherwise. Because the snapshot is generated from a single CLI release, a host that marks a model as `["text", "image"]` — for example through a `models.yml` or `models.json` model override — can send images on both transports before the catalog catches up. A host that narrows a catalogued vision model to text is likewise honored.
 
+## Web search
+
+The package includes a `web_search` tool as a separate extension entry (`commandcode-web-search.ts`), so it can be enabled or disabled independently of the provider. The tool calls Command Code's own search route with the credentials stored by `/login`, which means it works with any active model, not only Command Code models, but requires a logged-in Command Code account and counts against your Command Code usage.
+
+Two inputs are repaired rather than rejected, and the chosen behavior is reported in the result as a `Note:` line:
+
+- `numResults` above 10 is split across calls (up to three) and merged by URL, because the service ranks at most ten results per call.
+- `allowed_domains` together with `blocked_domains` keeps the intersection: the allow list is applied by the service and the block list is removed locally, because the service accepts only one of the two.
+
+The tool is read-only and marks itself `openWorldHint`. It is separate from pi's built-in tooling and from the official Command Code CLI.
+
 ## Pricing display
 
 The Command Code Provider API does not currently include prices in its model catalog. This extension therefore keeps a static table for models with known prices so pi and OMP can display estimated request costs. DeepSeek V4 uses time-dependent rates: the extension applies the documented 2x peak rates on weekdays from 01:00-04:00 and 06:00-10:00 UTC, and off-peak rates at all other times, including the entire weekend. The same request-time selection is used by the native Provider API path and the legacy generate fallback.
