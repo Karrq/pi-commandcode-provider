@@ -48,7 +48,13 @@ const quotaResult: CommandCodeQuotaResult = {
   ok: true,
   quota: {
     account: { login: "alice", orgId: null },
-    credits: null,
+    credits: {
+      monthlyCredits: 5,
+      purchasedCredits: 0,
+      freeCredits: 0,
+      remainingCredits: 5,
+      windowLimits: [{ window: "fiveHour", used: 1, cap: 2, resetAt: null }],
+    },
     subscription: null,
     summary: { totalCost: 1, totalCount: 2 },
   },
@@ -96,7 +102,7 @@ describe("commandcode:quota command", () => {
     await pi.handler("", ctx.value)
     assert.equal(pi.entries.length, 1)
     assert.equal(ctx.notifications.at(-1)?.type, "info")
-    assert.match(ctx.notifications.at(-1)?.message ?? "", /Requests: 2/)
+    assert.match(ctx.notifications.at(-1)?.message ?? "", /Usage windows \(remaining\)/)
   })
 
   it("warns without calling the endpoint when no API key is available", async () => {

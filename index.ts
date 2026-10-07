@@ -39,9 +39,10 @@ import { getApiKey as getOAuthApiKey, login, refreshToken } from "./src/oauth.ts
 import { normalizeCommandCodeMessage } from "./src/overflow.ts"
 import { MODEL_COSTS, ZERO_MODEL_COST } from "./src/pricing.ts"
 import { registerCommandCodeQuota } from "./src/quota-command.ts"
+import { createDiskQuotaAccountCache } from "./src/quota-account-cache.ts"
 import { alphaApiBase, commandCodeEnvHeaders } from "./src/quota-env.ts"
 import { formatQuota } from "./src/quota-format.ts"
-import type { CommandCodeQuota } from "./src/quota-types.ts"
+import type { CommandCodeQuota, QuotaAccountCache } from "./src/quota-types.ts"
 import { createCommandCodeRuntime } from "./src/runtime.ts"
 import { createCommandCodeUsageProvider, type UsageProvider } from "./src/usage.ts"
 import {
@@ -120,6 +121,16 @@ function providerApiKey(): string | undefined {
  */
 type CommandCodeProviderConfig = ProviderConfig & { usage?: UsageProvider }
 
+/**
+ * Shared account-identity cache for the command and the OMP usage provider.
+ * Sits beside the host's auth file in the agent dir, never inside it.
+ */
+let quotaAccountCache: QuotaAccountCache | undefined
+function commandCodeQuotaAccountCache(): QuotaAccountCache {
+  quotaAccountCache ??= createDiskQuotaAccountCache(join(getAgentDir(), "commandcode-account.json"))
+  return quotaAccountCache
+}
+
 function createProviderConfig(
   models: readonly CommandCodeModel[],
   apiBase: string,
@@ -138,6 +149,7 @@ function createProviderConfig(
     usage: createCommandCodeUsageProvider({
       apiBase: alphaApiBase(apiBase),
       headers,
+      accountCache: commandCodeQuotaAccountCache(),
     }),
     oauth: {
       name: "Command Code",
@@ -322,6 +334,7 @@ export default async function (pi: ExtensionAPI) {
   registerCommandCodeQuota(pi, {
     apiBase: alphaApiBase(apiBase),
     headers: commandCodeEnvHeaders(),
+    accountCache: commandCodeQuotaAccountCache(),
   })
 
   // `/commandcode:quota` appends its report as a durable session entry, so it

@@ -4,6 +4,7 @@
 
 - Render the `commandcode-zdr.armed` session entry in the transcript, so a branch shows where ZDR was armed and by what, instead of only a notification and a provider switch.
 - Gate ZDR arming on the active provider: zone touches on a non-Command-Code provider (for example `claude-bridge`) no longer append an armed entry, set `COMMANDCODE_ZDR_ARMED`, or arm the session, since the header is only ever sent to Command Code.
+- Rework the `/commandcode:quota` report around usage windows only: the 30-day, 5-hour, and weekly windows as remaining-percentage bars with reset times, with the remaining monthly credits next to the 30-day bar. The plan line and the separate billing-period usage block (cost, request count, tokens) are gone. The 30-day window is derived from the credits balance plus the billing-period spend, and its reset is the subscription's period end. After `whoami` resolves the org, the credits, subscriptions, and usage-summary requests now run together instead of the summary waiting on the subscription, dropping one serial round trip. The resolved account identity is cached on disk beside the agent's other Command Code files (not inside the host's auth file), keyed by a SHA-256 of the API key, so repeated fetches skip `whoami` and a rotated or refreshed credential misses by construction. The entry has no time-based expiry; it is dropped after a failed request so the next fetch re-resolves `whoami`.
 
 ## 0.7.3 - 2026-09-28
 

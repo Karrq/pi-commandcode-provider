@@ -20,6 +20,7 @@ import type {
   CommandCodeQuota,
   CommandCodeQuotaSection,
   CommandCodeWindowLimit,
+  QuotaAccountCache,
 } from "./quota-types.ts"
 
 export const COMMAND_CODE_PROVIDER = "commandcode"
@@ -222,6 +223,8 @@ export interface CreateCommandCodeUsageProviderOptions {
   headers?: Record<string, string>
   getConfiguredKey?: () => string | undefined
   fetchQuota?: typeof fetchCommandCodeQuota
+  /** Persists the resolved account identity so later fetches skip `whoami`. */
+  accountCache?: QuotaAccountCache
 }
 
 /**
@@ -251,6 +254,7 @@ export function createCommandCodeUsageProvider(
         baseUrl: options.apiBase,
         fetchImpl: context?.fetch,
         extraHeaders: options.headers,
+        accountCache: options.accountCache,
       })
       // A rejected key, an unreachable endpoint, or a changed schema is not
       // usage data: the host reports the account as having none.

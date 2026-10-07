@@ -44,12 +44,43 @@ export function formatWindowLimits(
   limits: readonly CommandCodeWindowLimit[],
   now: () => number = Date.now,
 ): string[] {
-  const labelWidth = Math.max(0, ...limits.map((limit) => WINDOW_LABELS[limit.window].length))
-  return limits.map((limit) => {
-    const remaining = windowRemainingPercent(limit)
-    const label = WINDOW_LABELS[limit.window].padEnd(labelWidth)
-    const reset = limit.resetAt === null ? "" : ` (resets ${formatResetClock(limit.resetAt, now)})`
-    return `${label} [${progressBar(remaining)}] ${String(remaining).padStart(3)}%${reset}`
+  return formatWindowRows(
+    limits.map((limit) => ({
+      label: WINDOW_LABELS[limit.window],
+      used: limit.used,
+      cap: limit.cap,
+      resetAt: limit.resetAt,
+    })),
+    now,
+  )
+}
+
+interface WindowRow {
+  label: string
+  /** Omit both `used` and `cap` to render a row without a meter. */
+  used?: number
+  cap?: number
+  resetAt: number | null
+  detail?: string
+}
+
+/**
+ * One `label [bar] NN% (resets ...) detail` line per row, label column padded
+ * to the widest label so the bars line up.
+ */
+function formatWindowRows(rows: readonly WindowRow[], now: () => number): string[] {
+  const labelWidth = Math.max(0, ...rows.map((row) => row.label.length))
+  return rows.map((row) => {
+    const label = row.label.padEnd(labelWidth)
+    const meter =
+      row.used === undefined || row.cap === undefined
+        ? ""
+        : (() => {
+            const remaining = percentRemaining(row.used, row.cap)
+            return `[${progressBar(remaining)}] ${String(remaining).padStart(3)}%`
+          })()
+    const reset = row.resetAt === null ? "" : `(resets ${formatResetClock(row.resetAt, now)})`
+    return [label, meter, reset, row.detail ?? ""].filter((part) => part.length > 0).join(" ")
   })
 }
 
@@ -78,80 +109,61 @@ function parsePeriodEnd(value: string): Date | null {
   return Number.isNaN(date.getTime()) ? null : date
 }
 
-function subscriptionLine(
-  subscription: CommandCodeSubscription,
-  now: () => number = Date.now,
-): string {
-  const plan = (subscription.planId ?? "Unknown").replace(/[_-]+/g, " ").trim()
-  const status = subscription.status ? ` (${subscription.status})` : ""
-  let renewal = ""
-  if (subscription.currentPeriodEnd) {
-    const end = parsePeriodEnd(subscription.currentPeriodEnd)
-    if (end) {
-      const diffMs = end.getTime() - now()
-      const days = Math.ceil(diffMs / 86_400_000)
-      const dateStr = end.toLocaleDateString("en-US", {
-        month: "short",
-        day: "numeric",
-        timeZone: "UTC",
-      })
-      if (days > 0) {
-        renewal = ` · renews ${dateStr} (${days}d)`
-      } else if (days === 0) {
-        renewal = ` · renews ${dateStr} (today)`
-      } else {
-        renewal = ` · renewed ${dateStr}`
-      }
-    }
-  }
-  return `Plan: ${plan}${status}${renewal}`
+function periodEndSeconds(subscription: CommandCodeSubscription | null): number | null {
+  if (!subscription?.currentPeriodEnd) return null
+  const end = parsePeriodEnd(subscription.currentPeriodEnd)
+  return end === null ? null : Math.round(end.getTime() / 1000)
 }
 
-function formatTokens(tokens: number): string {
-  if (tokens >= 1_000_000_000) return `${(tokens / 1_000_000_000).toFixed(1)}B`
-  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`
-  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}k`
-  return String(tokens)
-}
-
+/**
+ * Render the report: every remaining-usage window as a bar.
+ *
+ * The 30d row is derived, not reported: the credits endpoint carries the
+ * remaining balance but no cap, so the cap is the remaining balance plus the
+ * billing-period spend from `usage/summary`. Its reset is the subscription's
+ * period end.
+ */
 export function formatQuota(quota: CommandCodeQuota, now: () => number = Date.now): string {
   const lines: string[] = []
-  const remaining = quota.credits?.remainingCredits ?? 0
-  const spent = quota.summary?.totalCost ?? 0
-  const pool = remaining + spent
 
-  if (quota.subscription) {
-    lines.push(subscriptionLine(quota.subscription, now))
-  }
-
-  if (quota.credits || quota.summary) {
-    if (lines.length > 0) lines.push("")
-    const left = percentRemaining(spent, pool)
-    const bar = pool > 0 ? ` [${progressBar(left)}] ${String(left).padStart(3)}%` : ""
-    lines.push(`Credits${bar}`)
-    lines.push(`  Remaining: $${remaining.toFixed(2)} of $${pool.toFixed(2)}`)
-    lines.push(`  Used: $${spent.toFixed(2)}`)
-  }
-
-  if (quota.summary) {
-    lines.push("")
-    lines.push(quota.subscription?.currentPeriodStart ? "Usage (billing period)" : "Usage")
-    lines.push(`  Cost: $${quota.summary.totalCost.toFixed(2)}`)
-    lines.push(`  Requests: ${quota.summary.totalCount.toLocaleString("en-US")}`)
-    if (quota.summary.totalTokens !== undefined) {
-      lines.push(`  Tokens: ${formatTokens(quota.summary.totalTokens)}`)
+  const rows: WindowRow[] = []
+  const credits = quota.credits
+  if (credits) {
+    const used = quota.summary?.totalMonthlyCredits ?? quota.summary?.totalCost
+    const resetAt = periodEndSeconds(quota.subscription)
+    if (used === undefined) {
+      rows.push({
+        label: "30d",
+        resetAt,
+        detail: `$${credits.remainingCredits.toFixed(2)}`,
+      })
+    } else {
+      const cap = credits.remainingCredits + used
+      rows.push({
+        label: "30d",
+        used,
+        cap,
+        resetAt,
+        detail: `$${credits.remainingCredits.toFixed(2)}/$${cap.toFixed(2)}`,
+      })
     }
   }
+  for (const limit of credits?.windowLimits ?? []) {
+    rows.push({
+      label: WINDOW_LABELS[limit.window],
+      used: limit.used,
+      cap: limit.cap,
+      resetAt: limit.resetAt,
+    })
+  }
 
-  const limits = quota.credits?.windowLimits ?? []
-  if (limits.length > 0) {
-    lines.push("")
+  if (rows.length > 0) {
     lines.push("Usage windows (remaining)")
-    lines.push(...formatWindowLimits(limits, now).map((line) => `  ${line}`))
+    lines.push(...formatWindowRows(rows, now).map((line) => `  ${line}`))
   }
 
   if ((quota.unavailable?.length ?? 0) > 0) {
-    lines.push("")
+    if (lines.length > 0) lines.push("")
     lines.push(`Unavailable: ${quota.unavailable?.join(", ")}`)
   }
 

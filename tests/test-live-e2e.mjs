@@ -32,14 +32,6 @@ const expectedTransport =
     : testProfile === "goat" || testProfile === "provider"
       ? "provider"
       : undefined
-const expectedPlan =
-  testProfile === "go"
-    ? "go"
-    : testProfile === "goat"
-      ? "goat"
-      : testProfile === "provider"
-        ? "provider"
-        : undefined
 // GPT-5.6 Luna is available on every plan and has a ZDR-capable upstream;
 // Gemini 3.7 Flash currently fails with a zero-data-retention routing 404.
 const goatVisionModel = process.env.COMMANDCODE_E2E_GOAT_VISION_MODEL ?? "gpt-5.6-luna"
@@ -337,7 +329,7 @@ try {
   if (expectedTransport) assert.match(runtime.status, new RegExp(`transport: ${expectedTransport}`))
   assert.match(runtime.status, /source: (?:live|cache)/)
   assert.match(runtime.status, /model count: [1-9][0-9]*/)
-  if (expectedPlan) assert.match(runtime.quota, new RegExp(`Plan:.*\\b${expectedPlan}\\b`, "i"))
+  assert.match(runtime.quota, /Usage windows \(remaining\)/)
   assert.doesNotMatch(
     `${runtime.refresh}\n${runtime.status}\n${runtime.quota}\n${runtime.stderr}`,
     /Bearer\s+\S+/i,

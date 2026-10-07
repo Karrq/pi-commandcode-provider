@@ -6,6 +6,9 @@
  */
 
 import assert from "node:assert/strict"
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { describe, it } from "node:test"
 
 import { formatQuota, formatWindowLimits } from "../src/quota-format.ts"
@@ -15,6 +18,7 @@ import {
   redactValue,
   windowLimitsFromCredits,
 } from "../src/quota.ts"
+import { createDiskQuotaAccountCache } from "../src/quota-account-cache.ts"
 import type {
   CommandCodeCredits,
   CommandCodeQuota,
@@ -74,17 +78,24 @@ describe("Command Code quota", () => {
     assert.equal(limits[1]?.resetAt, 1_700_000_000)
   })
 
-  it("renders valid zero usage without claiming an unknown billing period", () => {
+  it("renders a 30d window from reported credits without a billing-period section", () => {
     const quota: CommandCodeQuota = {
       account: { login: "alice", orgId: null },
-      credits: null,
+      credits: {
+        monthlyCredits: 0,
+        purchasedCredits: 0,
+        freeCredits: 0,
+        remainingCredits: 0,
+        windowLimits: [],
+      },
       subscription: null,
       summary: { totalCost: 0, totalCount: 0 },
     }
     const output = formatQuota(quota, () => 1_700_000_000_000)
-    assert.match(output, /Usage\n/)
     assert.doesNotMatch(output, /billing period/)
-    assert.match(output, /Requests: 0/)
+    assert.doesNotMatch(output, /Requests:/)
+    assert.match(output, /Usage windows \(remaining\)/)
+    assert.match(output, /30d \[[█░]+\] +0% \$0\.00\/\$0\.00/)
   })
 
   it("formats window limits with percentage and reset clock", () => {
@@ -160,6 +171,88 @@ describe("Command Code quota", () => {
       )
       assert.equal((url.match(/https:\/\//g) ?? []).length, 1)
       assert.equal(url.includes(`${DEFAULT_API_BASE}${DEFAULT_API_BASE}`), false)
+    }
+  })
+
+  it("reuses the injected account cache and drops it after a failed request", async () => {
+    const requests: string[] = []
+    const stored = new Map<string, CommandCodeQuota["account"]>()
+    const accountCache = {
+      get: (apiKey: string) => stored.get(apiKey),
+      set: (apiKey: string, account: CommandCodeQuota["account"]) => {
+        stored.set(apiKey, account)
+      },
+      delete: (apiKey: string) => {
+        stored.delete(apiKey)
+      },
+    }
+    const okFetchImpl = async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input)
+      requests.push(url)
+      if (url.includes("whoami")) return jsonResponse({ user: { userName: "alice" }, org: null })
+      if (url.includes("credits")) return jsonResponse({ credits: { monthlyCredits: 5 } })
+      if (url.includes("subscriptions")) return jsonResponse({ data: { planId: "pro" } })
+      if (url.includes("summary")) return jsonResponse({ totalCost: 1, totalCount: 1 })
+      throw new Error(`Unexpected URL: ${url}`)
+    }
+    const whoamiCalls = () => requests.filter((url) => url.includes("whoami")).length
+
+    await fetchCommandCodeQuota({ apiKey: "cc_cache_key", fetchImpl: okFetchImpl, accountCache })
+    await fetchCommandCodeQuota({ apiKey: "cc_cache_key", fetchImpl: okFetchImpl, accountCache })
+    assert.equal(whoamiCalls(), 1)
+
+    // A different key never reuses another account's identity.
+    await fetchCommandCodeQuota({ apiKey: "cc_other_key", fetchImpl: okFetchImpl, accountCache })
+    assert.equal(whoamiCalls(), 2)
+
+    // A blocked request drops the cached identity so the next fetch re-resolves it.
+    const blockedFetch = async (input: RequestInfo | URL): Promise<Response> =>
+      String(input).includes("credits") ? jsonResponse({ error: "nope" }, 403) : okFetchImpl(input)
+    const blocked = await fetchCommandCodeQuota({
+      apiKey: "cc_cache_key",
+      fetchImpl: blockedFetch,
+      accountCache,
+    })
+    assert.equal(blocked.ok, false)
+    assert.equal(stored.has("cc_cache_key"), false)
+
+    await fetchCommandCodeQuota({ apiKey: "cc_cache_key", fetchImpl: okFetchImpl, accountCache })
+    assert.equal(whoamiCalls(), 3)
+  })
+
+  it("stores the account on disk keyed by a hash of the API key", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cc-quota-cache-"))
+    try {
+      const path = join(dir, "commandcode-account.json")
+      const cache = createDiskQuotaAccountCache(path)
+      const account = { login: "alice-inc", orgId: "org_1", keyName: "Pi Agent" }
+
+      assert.equal(cache.get("cc_secret_key"), undefined)
+      cache.set("cc_secret_key", account)
+      assert.deepEqual(cache.get("cc_secret_key"), account)
+      assert.equal(cache.get("cc_other_key"), undefined)
+      // The credential itself never lands in the cache file.
+      assert.doesNotMatch(readFileSync(path, "utf8"), /cc_secret_key/)
+
+      cache.delete("cc_secret_key")
+      assert.equal(cache.get("cc_secret_key"), undefined)
+      assert.doesNotMatch(readFileSync(path, "utf8"), /alice-inc/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("ignores a corrupt account cache instead of failing", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cc-quota-cache-"))
+    try {
+      const path = join(dir, "commandcode-account.json")
+      writeFileSync(path, "{ not json", "utf8")
+      const cache = createDiskQuotaAccountCache(path)
+      assert.equal(cache.get("cc_key"), undefined)
+      cache.set("cc_key", { login: "alice", orgId: null })
+      assert.deepEqual(cache.get("cc_key"), { login: "alice", orgId: null })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
     }
   })
 
@@ -336,17 +429,15 @@ describe("Command Code quota", () => {
 
     const output = formatQuota(quota, () => Date.parse("2026-01-15T00:00:00Z"))
     assert.doesNotMatch(output, /Command Code quota —/)
-    assert.match(output, /^Plan: pro \(active\) · renews Feb 1 \(17d\)/)
-    assert.match(output, /Credits \[[█░]+\] +82%\n  Remaining: \$55\.00 of \$67\.34/)
-    assert.match(output, /Used: \$12\.34/)
-    assert.match(output, /Usage \(billing period\)/)
-    assert.match(output, /Cost: \$12\.34/)
-    assert.match(output, /Requests: 1,500/)
-    assert.match(output, /Usage windows \(remaining\)/)
-    assert.match(output, /5h \[[█░]+\] +50%/)
-    assert.match(output, /7d \[[█░]+\] +50%/)
-    // The account identity, per-model sources, and the full-detail footer are
-    // intentionally not part of the report.
+    assert.doesNotMatch(output, /^Plan:/m)
+    assert.match(output, /^Usage windows \(remaining\)/)
+    assert.match(output, /30d \[[█░]+\] +82% \(resets in 17 days\) \$55\.00\/\$67\.34/)
+    assert.match(output, /5h +\[[█░]+\] +50%/)
+    assert.match(output, /7d +\[[█░]+\] +50%/)
+    // The billing-period usage totals are intentionally not part of the report.
+    assert.doesNotMatch(output, /Credits/)
+    assert.doesNotMatch(output, /billing period/)
+    assert.doesNotMatch(output, /Requests:/)
     assert.doesNotMatch(output, /Account/)
     assert.doesNotMatch(output, /alice-inc/)
     assert.doesNotMatch(output, /Sources:/)
@@ -354,45 +445,42 @@ describe("Command Code quota", () => {
     assert.doesNotMatch(output, /commandcode\.ai\/usage/)
   })
 
-  it("formats renewal dates in UTC and handles renewal edge cases", () => {
-    const baseQuota: CommandCodeQuota = {
-      account: { login: "alice", orgId: null },
-      credits: null,
-      subscription: null,
-      summary: null,
-    }
-    const formatRenewal = (currentPeriodEnd: string | null, now: string) =>
+  it("renders the 30d reset from the subscription period end", () => {
+    const formatReset = (currentPeriodEnd: string | null, now: string) =>
       formatQuota(
         {
-          ...baseQuota,
+          account: { login: "alice", orgId: null },
+          credits: {
+            monthlyCredits: 10,
+            purchasedCredits: 0,
+            freeCredits: 0,
+            remainingCredits: 10,
+            windowLimits: [],
+          },
           subscription: {
             planId: "pro",
             status: "active",
             currentPeriodStart: null,
             currentPeriodEnd,
           },
+          summary: { totalCost: 5, totalCount: 1 },
         },
         () => Date.parse(now),
       )
 
-    const beforeReset = formatRenewal("2026-02-01T00:00:00Z", "2026-01-31T12:00:00Z")
-    assert.match(beforeReset, /Plan: pro \(active\) · renews Feb 1 \(1d\)/)
+    const soon = formatReset("2026-02-01T00:00:00Z", "2026-01-31T12:00:00Z")
+    assert.match(soon, /30d \[[█░]+\] +67% \(resets in 12h\) \$10\.00\/\$15\.00/)
 
-    const numericTimestamp = formatRenewal(
-      String(Date.parse("2026-02-01T00:00:00Z")),
-      "2026-01-31T12:00:00Z",
-    )
-    assert.match(numericTimestamp, /Plan: pro \(active\) · renews Feb 1 \(1d\)/)
+    // Epoch-millisecond timestamps are accepted the same as ISO strings.
+    const numeric = formatReset(String(Date.parse("2026-02-01T00:00:00Z")), "2026-01-31T12:00:00Z")
+    assert.match(numeric, /\(resets in 12h\)/)
 
-    const today = formatRenewal("2026-01-31T12:00:00Z", "2026-01-31T12:00:00Z")
-    assert.match(today, /Plan: pro \(active\) · renews Jan 31 \(today\)/)
-
-    const expired = formatRenewal("2026-01-30T00:00:00Z", "2026-01-31T12:00:00Z")
-    assert.match(expired, /Plan: pro \(active\) · renewed Jan 30/)
+    // A period end already in the past renders as "soon".
+    const past = formatReset("2026-01-30T00:00:00Z", "2026-01-31T12:00:00Z")
+    assert.match(past, /\(resets soon\)/)
 
     for (const currentPeriodEnd of [null, "not-a-date"]) {
-      const output = formatRenewal(currentPeriodEnd, "2026-01-31T12:00:00Z")
-      assert.doesNotMatch(output, /renews|renewed/)
+      assert.doesNotMatch(formatReset(currentPeriodEnd, "2026-01-31T12:00:00Z"), /resets/)
     }
   })
 

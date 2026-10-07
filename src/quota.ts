@@ -6,6 +6,7 @@ import type {
   CommandCodeSubscription,
   CommandCodeUsageSummary,
   CommandCodeWindowLimit,
+  QuotaAccountCache,
 } from "./quota-types.ts"
 
 export const DEFAULT_API_BASE = "https://api.commandcode.ai"
@@ -17,6 +18,8 @@ interface FetchOptions {
   fetchImpl?: typeof fetch
   timeoutMs?: number
   extraHeaders?: Record<string, string>
+  /** Reuses a resolved account identity instead of calling `whoami` again. */
+  accountCache?: QuotaAccountCache
 }
 
 interface HttpErrorShape {
@@ -124,7 +127,13 @@ function parseSummary(value: unknown): CommandCodeUsageSummary | null {
   const totalCount = numberValue(value.totalCount)
   if (totalCost === undefined || totalCount === undefined) return null
   const totalTokens = numberValue(value.totalTokens) ?? numberValue(value.tokens)
-  return { totalCost, totalCount, ...(totalTokens === undefined ? {} : { totalTokens }) }
+  const totalMonthlyCredits = numberValue(value.totalMonthlyCredits)
+  return {
+    totalCost,
+    totalCount,
+    ...(totalTokens === undefined ? {} : { totalTokens }),
+    ...(totalMonthlyCredits === undefined ? {} : { totalMonthlyCredits }),
+  }
 }
 
 function parseWhoami(value: unknown): {
@@ -246,26 +255,48 @@ export async function fetchCommandCodeQuota(
   }
 
   try {
-    const whoamiRaw = await request("/alpha/whoami")
-    if (isHttpError(whoamiRaw)) return httpFailure(whoamiRaw, "whoami")
-    const account = parseWhoami(whoamiRaw)
+    let account = options.accountCache?.get(options.apiKey)
     if (!account) {
-      return {
-        ok: false,
-        error: { kind: "http", message: "Command Code returned an unrecognized account response" },
+      const whoamiRaw = await request("/alpha/whoami")
+      if (isHttpError(whoamiRaw)) return httpFailure(whoamiRaw, "whoami")
+      const parsed = parseWhoami(whoamiRaw)
+      if (!parsed) {
+        return {
+          ok: false,
+          error: {
+            kind: "http",
+            message: "Command Code returned an unrecognized account response",
+          },
+        }
       }
+      account = parsed
+      options.accountCache?.set(options.apiKey, parsed)
     }
 
     const orgId = account.orgId ?? undefined
-    const [creditsRaw, subscriptionRaw] = await Promise.all([
+    // All three billing endpoints key off the same orgId, so they run together:
+    // one round trip after whoami instead of two. `usage/summary` defaults to the
+    // current billing period, so it no longer waits on currentPeriodStart.
+    const [creditsRaw, subscriptionRaw, summaryRaw] = await Promise.all([
       safeRequest(buildUrl("/alpha/billing/credits", { orgId })),
       safeRequest(buildUrl("/alpha/billing/subscriptions", { orgId })),
+      safeRequest(buildUrl("/alpha/usage/summary", { orgId })),
     ])
+    // Any failed request can mean the cached identity no longer matches the
+    // server, so drop it and let the next fetch resolve whoami afresh.
+    if (
+      [creditsRaw, subscriptionRaw, summaryRaw].some((raw) => isHttpError(raw) || isQuotaError(raw))
+    ) {
+      options.accountCache?.delete(options.apiKey)
+    }
     if (isHttpError(creditsRaw) && isBlockingHttpError(creditsRaw)) {
       return httpFailure(creditsRaw, "credits")
     }
     if (isHttpError(subscriptionRaw) && isBlockingHttpError(subscriptionRaw)) {
       return httpFailure(subscriptionRaw, "subscription")
+    }
+    if (isHttpError(summaryRaw) && isBlockingHttpError(summaryRaw)) {
+      return httpFailure(summaryRaw, "summary")
     }
 
     const unavailable: CommandCodeQuotaSection[] = []
@@ -277,16 +308,6 @@ export async function fetchCommandCodeQuota(
         ? null
         : parseSubscription(subscriptionRaw)
     if (!subscription) unavailable.push("subscription")
-
-    const summaryRaw = await safeRequest(
-      buildUrl("/alpha/usage/summary", {
-        orgId,
-        since: subscription?.currentPeriodStart ?? undefined,
-      }),
-    )
-    if (isHttpError(summaryRaw) && isBlockingHttpError(summaryRaw)) {
-      return httpFailure(summaryRaw, "summary")
-    }
     const summary =
       isHttpError(summaryRaw) || isQuotaError(summaryRaw) ? null : parseSummary(summaryRaw)
     if (!summary) unavailable.push("usage")

@@ -24,6 +24,8 @@ export interface CommandCodeUsageSummary {
   totalCost: number
   totalCount: number
   totalTokens?: number
+  /** Monthly credits spent this billing period, when the API reports it. */
+  totalMonthlyCredits?: number
 }
 
 export type CommandCodeQuotaSection = "credits" | "subscription" | "usage"
@@ -38,6 +40,19 @@ export interface CommandCodeQuota {
   subscription: CommandCodeSubscription | null
   summary: CommandCodeUsageSummary | null
   unavailable?: readonly CommandCodeQuotaSection[]
+}
+
+/**
+ * Reuses a resolved account identity instead of re-calling `whoami`.
+ *
+ * Keyed by API key so a rotated or refreshed credential misses by construction.
+ * The quota layer never writes to the host's auth file; implementations decide
+ * where the entry lives.
+ */
+export interface QuotaAccountCache {
+  get(apiKey: string): CommandCodeQuota["account"] | undefined
+  set(apiKey: string, account: CommandCodeQuota["account"]): void
+  delete(apiKey: string): void
 }
 
 export type CommandCodeQuotaErrorKind = "config" | "http" | "network" | "timeout"

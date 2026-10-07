@@ -25,8 +25,10 @@ import { Container, type SettingItem, SettingsList, Text, type TUI } from "@eare
 
 import { getConfiguredApiKey } from "./src/api-key.ts"
 import { pickCommandCodeApiKey } from "./src/converters.ts"
+import { createDiskQuotaAccountCache } from "./src/quota-account-cache.ts"
 import { commandCodeAlphaBase, commandCodeEnvHeaders } from "./src/quota-env.ts"
 import { fetchCommandCodeQuota } from "./src/quota.ts"
+import type { QuotaAccountCache } from "./src/quota-types.ts"
 import {
   DEFAULT_USAGE_SETTINGS,
   formatUsageWidget,
@@ -38,11 +40,22 @@ import {
 const PROVIDER = "commandcode"
 const WIDGET_KEY = "commandcode-usage"
 const SETTINGS_FILE = "commandcode-usage.json"
+const ACCOUNT_FILE = "commandcode-account.json"
 /** Re-fetch at most this often; the 5h and weekly windows move slowly. */
 const REFRESH_INTERVAL_MS = 30_000
 
 function settingsPath(): string {
   return join(getAgentDir(), SETTINGS_FILE)
+}
+
+/**
+ * Account identities live beside the other Command Code files, keyed by API key,
+ * so a re-login or token refresh misses by construction.
+ */
+let accountCache: QuotaAccountCache | undefined
+function quotaAccountCache(): QuotaAccountCache {
+  accountCache ??= createDiskQuotaAccountCache(join(getAgentDir(), ACCOUNT_FILE))
+  return accountCache
 }
 
 function readSettings(): UsageSettings {
@@ -132,6 +145,7 @@ export default function commandCodeUsage(pi: ExtensionAPI) {
         apiKey,
         baseUrl: commandCodeAlphaBase(),
         extraHeaders: commandCodeEnvHeaders(),
+        accountCache: quotaAccountCache(),
       })
       latest = result.ok ? { quota: result.quota } : { quota: null, error: result.error.message }
     } catch (error) {

@@ -2,7 +2,7 @@ import { getConfiguredApiKey } from "./api-key.ts"
 import { pickCommandCodeApiKey } from "./converters.ts"
 import { fetchCommandCodeQuota, redactValue } from "./quota.ts"
 import { formatQuota } from "./quota-format.ts"
-import type { CommandCodeQuota } from "./quota-types.ts"
+import type { CommandCodeQuota, QuotaAccountCache } from "./quota-types.ts"
 
 export interface QuotaCommandContext {
   mode?: "tui" | "rpc" | "json" | "print"
@@ -31,6 +31,8 @@ interface RegisterQuotaCommandOptions {
   headers?: Record<string, string>
   getConfiguredKey?: () => string | undefined
   fetchQuota?: typeof fetchCommandCodeQuota
+  /** Persists the resolved account identity so later fetches skip `whoami`. */
+  accountCache?: QuotaAccountCache
 }
 
 /**
@@ -65,6 +67,7 @@ export function registerCommandCodeQuota(
         apiKey,
         baseUrl: options.apiBase,
         extraHeaders: options.headers,
+        accountCache: options.accountCache,
       })
       if (!result.ok) {
         ctx.ui.notify(redactValue(result.error.message), "error")
