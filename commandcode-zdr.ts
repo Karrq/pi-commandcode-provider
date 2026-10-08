@@ -47,6 +47,19 @@
  * `zonesJevRecord` turns that off. A ZDR
  * rejection while armed never falls back: resolveRejection refuses.
  *
+ * The switch is awaited on `session_start`, and pi runs that hook before it
+ * reads the first prompt, so the first request of a resumed session already
+ * uses the ZDR provider. If the switch cannot complete (no ZDR counterpart, or
+ * the host has not finished registering the provider's auth),
+ * `before_agent_start` retries it before the request is built. When it still
+ * fails, the provider transport refuses the request rather than sending it
+ * without the header: rpc, print and json modes block outright, while the
+ * terminal UI asks whether to send without ZDR for the session. A manual pick
+ * to the plain commandcode provider in the terminal UI is that same consent, and
+ * lasts until the session leaves the armed state. Virtual models (e.g.
+ * `jev/auto`) are armed too, since they can route to a Command Code model; the
+ * transport gate then enforces on the concrete routed model.
+ *
  * The provider rejects with HTTP 422 `cmd_zdr_no_providers` when no upstream
  * honours zero data retention for the requested model.
  *
@@ -81,6 +94,7 @@ import {
 } from "./src/providers.ts"
 import {
   republishCommandCodeZdr,
+  setCommandCodeZdrBlocker,
   setCommandCodeZdrDecider,
   setCommandCodeZdrExcluded,
 } from "./src/zdr-state.ts"
@@ -131,6 +145,9 @@ type ZdrScope = "global" | "project"
 
 /** How a Jev consult ended. */
 type JevVerdict = "armed" | "skipped" | "blocked" | "guard-off"
+
+/** Result of trying to move an armed session onto the ZDR provider. */
+type SwitchOutcome = "switched" | "skipped" | "failed"
 
 /** Where a recorded probability came from. */
 type JevSource = "classifier" | "cache" | "none"
@@ -322,6 +339,14 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
   let armed = false
   /** Why the session is armed, for the editor status row. */
   let armedSource: string | undefined
+  /**
+   * Set when an interactive user chose to keep an armed session on the plain
+   * commandcode provider, so requests may go out without zero data retention.
+   * Session-wide; the transport gate reads it. Never persisted.
+   */
+  let consentedPlain = false
+  /** Whether the switch-failure prompt was already shown this session. */
+  let unswitchedPrompted = false
   /** Normalized zones for the current cwd. */
   let zones: string[] = []
   /** Recent Jev answers, keyed by command, so repeated calls do not re-classify. */
@@ -392,13 +417,30 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
   }
 
   /**
-   * Publish the header decision to the provider transport, the only path every
-   * request takes (including worker agent loops that never run pi's header
-   * hook). The provider is the ZDR mode, so the decider is always published;
-   * the environment force and the per-model releases are handled inside it.
+   * Publish the header decision and the block policy to the provider
+   * transport, the only path every request takes (including worker agent loops
+   * that never run pi's header hook). The provider is the ZDR mode, so the
+   * decider is always published; the environment force and the per-model
+   * releases are handled inside it. The blocker is what stops a request from
+   * leaving on the plain provider while the session is armed and unswitched.
    */
   function publishDecider(): void {
     setCommandCodeZdrDecider((modelId, provider) => sendZdrFor(modelId, provider))
+    setCommandCodeZdrBlocker((_modelId, provider, sendZdr) => blockReasonFor(provider, sendZdr))
+  }
+
+  /**
+   * Why a request on this provider must not be sent, or undefined to allow it.
+   * Only Command Code is governed; other providers are outside ZDR. The
+   * transport passes the header decision it already made, so a request that
+   * carries the header (or is force-enabled) is never blocked. The gate lives
+   * in the transport, so it also covers worker loops that never see the session
+   * hooks.
+   */
+  function blockReasonFor(provider: string | undefined, sendZdr: boolean): string | undefined {
+    if (!armed || consentedPlain) return undefined
+    if (!isCommandCodeProvider(provider) || sendZdr) return undefined
+    return "ZDR is armed because protected data was read, but this request would go to Command Code without zero data retention. The request was not sent. Use a model that supports ZDR; in an interactive session you can also pick the plain commandcode provider to allow non-ZDR for the session."
   }
 
   /** Guard so a provider switch does not re-enter while it is in flight. */
@@ -411,28 +453,68 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
    * It only moves toward ZDR: it never forces a session back to the plain
    * provider, so picking another provider after arming is a real override that
    * sticks. Models the ZDR policy excludes are absent from the ZDR catalog, so
-   * an armed session stays on the plain provider for them. A failed switch
-   * leaves the decision to the transport, which follows the provider.
+   * an armed session stays on the plain provider for them. "failed" then lets
+   * the caller block or ask, and the transport gate refuses the request.
    */
-  async function applyProviderForArmed(ctx: ExtensionContext): Promise<void> {
-    if (!armed) return
+  async function applyProviderForArmed(ctx: ExtensionContext): Promise<SwitchOutcome> {
+    if (!armed) return "skipped"
     const model = ctx.model
-    if (!model || switching) return
-    if (model.provider !== PROVIDER) return
+    if (!model || switching) return "skipped"
+    if (model.provider !== PROVIDER) return "skipped"
     const target = ctx.modelRegistry.find(ZDR_PROVIDER, model.id)
-    if (!target) return
+    if (!target) return "failed"
     switching = true
     try {
       // setModel returns false until the host finishes its auth refresh for the
       // freshly registered ZDR provider, so retry briefly.
       for (let attempt = 0; attempt < 4; attempt++) {
-        if (await pi.setModel(target)) return
+        if (await pi.setModel(target)) return "switched"
         await new Promise((resolve) => setTimeout(resolve, 150))
       }
+      return "failed"
     } catch {
-      // A failed switch leaves the provider decision to the transport.
+      // A failed switch leaves the block decision to the transport.
+      return "failed"
     } finally {
       switching = false
+    }
+  }
+
+  /**
+   * Make sure an armed session is on the ZDR provider, asking the user when it
+   * cannot be. Interactive sessions may keep running on the plain provider if
+   * the user accepts the loss of zero data retention; every other mode leaves
+   * the gate closed, and the transport refuses the request.
+   */
+  async function ensureZdrProvider(ctx: ExtensionContext): Promise<void> {
+    if (!armed || consentedPlain) return
+    if (ctx.model?.provider === ZDR_PROVIDER) {
+      // Back on the ZDR provider; a previous non-ZDR consent no longer applies.
+      consentedPlain = false
+      unswitchedPrompted = false
+      return
+    }
+    const outcome = await applyProviderForArmed(ctx)
+    if (outcome === "switched") {
+      consentedPlain = false
+      unswitchedPrompted = false
+      return
+    }
+    if (outcome !== "failed" || unswitchedPrompted) return
+    unswitchedPrompted = true
+    // Non-interactive callers (RPC, print, json) have no user to judge for, so
+    // the request stays blocked. Ask only in the terminal UI.
+    if (ctx.mode !== "tui") return
+    const choice = await ctx.ui.select(
+      "ZDR is armed because protected data was read, but this model could not be switched to the commandcode-zdr provider. How should this proceed?",
+      ["Block requests (recommended)", "Continue without ZDR for this session"],
+    )
+    if (choice === "Continue without ZDR for this session") {
+      consentedPlain = true
+      ctx.ui.notify(
+        "ZDR is off for this session: requests will be sent without zero data retention.",
+        "warning",
+      )
     }
   }
 
@@ -487,11 +569,17 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
    * Keep the zone machinery dormant there instead of marking the session.
    */
   function zdrActiveFor(ctx: ExtensionContext): boolean {
-    return isCommandCodeProvider(ctx.model?.provider)
+    const model = ctx.model
+    if (!model) return false
+    // A virtual model never reaches a provider; it routes per request and can
+    // reach a Command Code model, so arm it too. The transport gate then
+    // enforces on the concrete routed model.
+    if (model.api === "pi-virtual") return true
+    return isCommandCodeProvider(model.provider)
   }
 
   /** Persist arming on the branch, mirror it into the environment, and notify once. */
-  function arm(ctx: ExtensionContext, source: string, detail?: string): void {
+  async function arm(ctx: ExtensionContext, source: string, detail?: string): Promise<void> {
     // Nothing to arm on a provider ZDR does not govern.
     if (!zdrActiveFor(ctx)) return
     // One marker per branch is enough to arm it; repeated touches only add noise.
@@ -502,16 +590,20 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     armed = true
     armedSource = source
     publishDecider()
-    void applyProviderForArmed(ctx)
     ctx.ui.notify(
       `${describeArmedMarker(marker)}. Protected data was touched, so requests now require zero data retention.`,
       "info",
     )
+    // Settle the provider before the next request. Awaiting keeps the switch (or
+    // the interactive question) ahead of the turn that follows the tool call.
+    await ensureZdrProvider(ctx)
   }
 
   function disarm(): void {
     armed = false
     armedSource = undefined
+    consentedPlain = false
+    unswitchedPrompted = false
     delete process.env[ARMED_ENV]
     publishDecider()
   }
@@ -537,7 +629,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
    * Navigating to a branch that never armed disarms; arming found there (or in
    * the cwd, or inherited from a parent) is persisted so it survives a reload.
    */
-  function recomputeArmed(ctx: ExtensionContext): void {
+  async function recomputeArmed(ctx: ExtensionContext): Promise<void> {
     // ZDR does not govern other providers, so never arm or stay armed there.
     if (!zdrActiveFor(ctx)) {
       disarm()
@@ -561,10 +653,13 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
           ...(cwdZone ? { detail: cwdZone } : {}),
         })
     } else {
+      // Leaving the armed state drops any non-ZDR consent with it.
       delete process.env[ARMED_ENV]
+      consentedPlain = false
+      unswitchedPrompted = false
     }
     publishDecider()
-    void applyProviderForArmed(ctx)
+    if (armed) await ensureZdrProvider(ctx)
   }
 
   /**
@@ -623,12 +718,47 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     resolveConfig(ctx)
-    recomputeArmed(ctx)
+    // Await the provider switch: pi runs this hook before it reads the first
+    // prompt in every mode, so an awaited switch is in place before the first
+    // request. A failed switch is retried in `before_agent_start`.
+    await recomputeArmed(ctx)
   })
 
   pi.on("session_tree", async (_event, ctx) => {
     // The branch changed, so arming may have been added or left behind.
-    recomputeArmed(ctx)
+    await recomputeArmed(ctx)
+  })
+
+  /**
+   * A manual model choice is the user's judgement about ZDR. In the terminal UI,
+   * switching an armed session to the plain commandcode provider is consent to
+   * run without zero data retention for the rest of the session. RPC, print and
+   * json sessions have no such judgement, so they stay blocked.
+   */
+  pi.on("model_select", async (event, ctx) => {
+    const provider = event.model?.provider
+    if (provider === ZDR_PROVIDER) {
+      // Back on the ZDR provider, so a previous consent no longer applies.
+      consentedPlain = false
+      unswitchedPrompted = false
+      return
+    }
+    if (!armed || consentedPlain) return
+    if (ctx.mode !== "tui" || provider !== PROVIDER) return
+    consentedPlain = true
+    ctx.ui.notify(
+      "ZDR is armed, but the model was switched to the non-ZDR commandcode provider. Requests will be sent without zero data retention for this session.",
+      "warning",
+    )
+  })
+
+  /**
+   * Retry the switch right before a run, then ask if it still fails. pi awaits
+   * this hook before it builds the request, so the answer lands before any data
+   * leaves.
+   */
+  pi.on("before_agent_start", async (_event, ctx) => {
+    await ensureZdrProvider(ctx)
   })
 
   pi.on("session_before_switch", async () => {
@@ -638,6 +768,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     disarm()
     setCommandCodeZdrDecider(undefined)
+    setCommandCodeZdrBlocker(undefined)
   })
 
   pi.on("tool_call", async (event, ctx) => {
@@ -652,7 +783,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
       if (!command) return
       const mentioned = commandMentionsZone(command, zones, cwd)
       if (mentioned) {
-        arm(ctx, "bash", mentioned)
+        await arm(ctx, "bash", mentioned)
         return
       }
       return consultJev(ctx, command)
@@ -661,13 +792,13 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     if (field) {
       const value = input[field]
       if (typeof value === "string" && pathInZones(value, zones, cwd))
-        arm(ctx, event.toolName, value)
+        await arm(ctx, event.toolName, value)
       return
     }
     // Any other tool: a string argument naming a zone is enough to arm. Over-arming is safe.
     for (const value of Object.values(input)) {
       if (typeof value === "string" && pathInZones(value, zones, cwd)) {
-        arm(ctx, event.toolName, value)
+        await arm(ctx, event.toolName, value)
         return
       }
     }
@@ -762,7 +893,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
     // one above 0.5, falls through to the prompt so the user can skip arming.
     if (probability !== undefined && (confidence ?? 0) >= min) {
       if (probability >= 0.5) {
-        arm(ctx, "jev", command)
+        await arm(ctx, "jev", command)
         recordJev(ctx, {
           command,
           source,
@@ -791,7 +922,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
           )}%, too close to call.`
 
     if (ctx.mode !== "tui") {
-      arm(ctx, "jev", command)
+      await arm(ctx, "jev", command)
       ctx.ui.notify(
         `ZDR: ${detail} There is no terminal to ask in, so enforcement is armed.`,
         "warning",
@@ -826,7 +957,7 @@ export default function commandCodeZdr(pi: ExtensionAPI) {
       elapsedMs: Date.now() - started,
     }
     if (choice === "Arm ZDR for this session (recommended)") {
-      arm(ctx, "jev", command)
+      await arm(ctx, "jev", command)
       recordJev(ctx, { ...record, verdict: "armed" })
       return
     }

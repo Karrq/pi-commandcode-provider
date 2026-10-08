@@ -9,9 +9,11 @@ import assert from "node:assert/strict"
 import { describe, it } from "node:test"
 
 import {
+  commandCodeZdrBlockReason,
   commandCodeZdrExcluded,
   commandCodeZdrFor,
   republishCommandCodeZdr,
+  setCommandCodeZdrBlocker,
   setCommandCodeZdrExcluded,
   setCommandCodeZdrDecider,
   setCommandCodeZdrRepublish,
@@ -57,6 +59,24 @@ describe("commandCodeZdrExcluded", () => {
     assert.equal(commandCodeZdrExcluded("a"), false)
     setCommandCodeZdrExcluded(undefined)
     assert.equal(commandCodeZdrExcluded("a"), false)
+  })
+})
+
+describe("commandCodeZdrBlockReason", () => {
+  it("blocks nothing with no published blocker", () => {
+    setCommandCodeZdrBlocker(undefined)
+    assert.equal(commandCodeZdrBlockReason("m", "commandcode", false), undefined)
+  })
+
+  it("returns the published reason, honoring the header decision, and clears with undefined", () => {
+    setCommandCodeZdrBlocker((modelId, provider, sendZdr) =>
+      provider === "commandcode" && !sendZdr ? `blocked ${modelId}` : undefined,
+    )
+    assert.equal(commandCodeZdrBlockReason("m", "commandcode", false), "blocked m")
+    assert.equal(commandCodeZdrBlockReason("m", "commandcode", true), undefined)
+    assert.equal(commandCodeZdrBlockReason("m", "commandcode-zdr", false), undefined)
+    setCommandCodeZdrBlocker(undefined)
+    assert.equal(commandCodeZdrBlockReason("m", "commandcode", false), undefined)
   })
 })
 

@@ -53,6 +53,7 @@ import {
 import { transcriptReadersFrom, withTranscriptPromptAndTools } from "./src/transcript.ts"
 import { createCommandCodeTransportRouter } from "./src/transport.ts"
 import {
+  commandCodeZdrBlockReason,
   commandCodeZdrExcluded,
   commandCodeZdrFor,
   resolveCommandCodeZdrKey,
@@ -131,6 +132,37 @@ function commandCodeQuotaAccountCache(): QuotaAccountCache {
   return quotaAccountCache
 }
 
+/** Map the Command Code catalog to pi model definitions, shared by both providers. */
+function createProviderModels(models: readonly CommandCodeModel[], apiBase: string) {
+  return models.map((model) => ({
+    id: model.id,
+    name: model.name,
+    api: COMMAND_CODE_API,
+    baseUrl: baseUrlForModel(apiBase, model.api),
+    reasoning: model.reasoning,
+    ...(thinkingMetadataForModel(model.id) ?? {}),
+    input: [...inputModalitiesForModel(model.id)],
+    cost: MODEL_COSTS[model.id] ?? ZERO_MODEL_COST,
+    contextWindow: model.contextWindow,
+    maxTokens: model.maxTokens,
+    compat:
+      model.api === "openai-completions"
+        ? {
+            supportsStore: false,
+            supportsDeveloperRole: false,
+            supportsReasoningEffort: MODEL_EFFORTS[model.id] !== undefined,
+            maxTokensField: "max_tokens",
+          }
+        : {
+            supportsEagerToolInputStreaming: false,
+            supportsLongCacheRetention: false,
+            supportsCacheControlOnTools: false,
+            supportsToolReferences: false,
+            ...(model.reasoning ? { forceAdaptiveThinking: true } : {}),
+          },
+  }))
+}
+
 function createProviderConfig(
   models: readonly CommandCodeModel[],
   apiBase: string,
@@ -157,33 +189,7 @@ function createProviderConfig(
       refreshToken,
       getApiKey: getOAuthApiKey,
     },
-    models: models.map((model) => ({
-      id: model.id,
-      name: model.name,
-      api: COMMAND_CODE_API,
-      baseUrl: baseUrlForModel(apiBase, model.api),
-      reasoning: model.reasoning,
-      ...(thinkingMetadataForModel(model.id) ?? {}),
-      input: [...inputModalitiesForModel(model.id)],
-      cost: MODEL_COSTS[model.id] ?? ZERO_MODEL_COST,
-      contextWindow: model.contextWindow,
-      maxTokens: model.maxTokens,
-      compat:
-        model.api === "openai-completions"
-          ? {
-              supportsStore: false,
-              supportsDeveloperRole: false,
-              supportsReasoningEffort: MODEL_EFFORTS[model.id] !== undefined,
-              maxTokensField: "max_tokens",
-            }
-          : {
-              supportsEagerToolInputStreaming: false,
-              supportsLongCacheRetention: false,
-              supportsCacheControlOnTools: false,
-              supportsToolReferences: false,
-              ...(model.reasoning ? { forceAdaptiveThinking: true } : {}),
-            },
-    })),
+    models: createProviderModels(models, apiBase),
   }
 }
 
@@ -192,37 +198,55 @@ export default async function (pi: ExtensionAPI) {
   let zdrProvider: Provider | undefined
   /** Last session context, for (re)registering the ZDR provider. */
   let lastCtx: ExtensionContext | undefined
+  /** Latest base catalog, used to build the ZDR catalog before a session exists. */
+  let baseCatalog: readonly CommandCodeModel[] = []
+
+  /** The base catalog as chat models; `readModels` tags them with the ZDR provider. */
+  function zdrModelsFromCatalog(): ReturnType<Provider["getModels"]> {
+    return createProviderModels(baseCatalog, apiBase) as unknown as ReturnType<
+      Provider["getModels"]
+    >
+  }
 
   /**
    * Register the ZDR provider, mirroring the `commandcode` catalog with zero
    * data retention always on.
    *
-   * The stream functions come from the composed `commandcode` provider, but the
-   * auth is ours: the ZDR provider has no credential of its own, so it resolves
-   * through the `commandcode` credential, which pi refreshes when the OAuth
-   * token expires. `getModels` reads the live `commandcode` catalog on every
-   * call, so a model catalog refresh updates both providers at once, and it
-   * drops the models the ZDR policy excludes so they cannot be selected under
-   * ZDR.
+   * pi restores a session's model before it emits `session_start`, so the
+   * provider must exist as soon as the extension loads, or a session whose last
+   * model was the ZDR provider falls back to another model with a warning. Before
+   * the first context there is no registry to read, so the catalog comes from the
+   * same definitions the base provider was registered with and the key is read
+   * from the stored credential; `session_start` and every later catalog refresh
+   * re-register from the live composed `commandcode` provider instead.
+   *
+   * The auth is ours: the ZDR provider has no credential of its own, so it
+   * resolves through the `commandcode` credential, which pi refreshes when the
+   * OAuth token expires. The catalog drops the models the ZDR policy excludes so
+   * they cannot be selected under ZDR.
    */
-  function registerZdrProvider(ctx: ExtensionContext): void {
-    lastCtx = ctx
-    const registry = ctx.modelRegistry
-    const base = registry.getProvider(COMMAND_CODE_PROVIDER)
-    if (!base) return
-    setCommandCodeZdrKeyResolver(() => registry.getApiKeyForProvider(COMMAND_CODE_PROVIDER))
-    const readModels = () => {
-      const live = registry.getProvider(COMMAND_CODE_PROVIDER)
-      if (!live) return []
-      return live
-        .getModels()
+  function registerZdrProvider(ctx?: ExtensionContext): void {
+    if (ctx) lastCtx = ctx
+    const registry = lastCtx?.modelRegistry
+    const base = registry?.getProvider(COMMAND_CODE_PROVIDER)
+    setCommandCodeZdrKeyResolver(
+      registry
+        ? () => registry.getApiKeyForProvider(COMMAND_CODE_PROVIDER)
+        : async () => getConfiguredApiKey(),
+    )
+    const readModels = (): ReturnType<Provider["getModels"]> => {
+      const live = registry?.getProvider(COMMAND_CODE_PROVIDER)
+      const models = live ? live.getModels() : zdrModelsFromCatalog()
+      return models
         .filter((model) => !commandCodeZdrExcluded(model.id))
         .map((model) => ({ ...model, provider: COMMAND_CODE_ZDR_PROVIDER }))
     }
+    const streamSimple = (base?.streamSimple ?? transport.stream) as ProviderConfig["streamSimple"]
     const provider: Provider = {
-      ...base,
       id: COMMAND_CODE_ZDR_PROVIDER,
       name: ZDR_PROVIDER_NAME,
+      baseUrl: base?.baseUrl ?? apiBase,
+      headers: base?.headers,
       auth: {
         apiKey: {
           name: "Command Code credential",
@@ -238,6 +262,8 @@ export default async function (pi: ExtensionAPI) {
       },
       getModels: readModels,
       getAllModels: readModels,
+      stream: (base?.stream ?? streamSimple) as Provider["stream"],
+      streamSimple,
       // The catalog is read live, so this provider has nothing to refresh.
       refreshModels: async () => {},
     }
@@ -248,7 +274,7 @@ export default async function (pi: ExtensionAPI) {
   /** Re-register the ZDR provider so its catalog picks up new exclusions. */
   setCommandCodeZdrRepublish(() => {
     if (zdrProvider) pi.registerProvider(zdrProvider)
-    else if (lastCtx) registerZdrProvider(lastCtx)
+    else registerZdrProvider(lastCtx)
   })
 
   // Hosts may select their built-in Command Code model before loading extensions.
@@ -285,8 +311,16 @@ export default async function (pi: ExtensionAPI) {
     const headers = { ...(options?.headers ?? {}) }
     // The provider is the ZDR mode: the decider is asked with the provider and
     // owns every override (exclusions, releases, the environment force).
-    if (commandCodeZdrFor(model.id, model.provider)) headers["x-cmd-zdr"] = "1"
+    const sendZdr = commandCodeZdrFor(model.id, model.provider)
+    if (sendZdr) headers["x-cmd-zdr"] = "1"
     else delete headers["x-cmd-zdr"]
+    // A blocked request must not leave at all, so this runs before the request
+    // is built and throws instead of sending. It receives the header decision
+    // above so the check does not consume a one-shot release a second time.
+    // Throwing here is caught by the transport router and surfaced as an
+    // assistant error message.
+    const blocked = commandCodeZdrBlockReason(model.id, model.provider, sendZdr)
+    if (blocked) throw new Error(blocked)
     return { ...options, headers }
   }
   // The provider transport delegates to pi-ai, which reads the transcript
@@ -355,7 +389,15 @@ export default async function (pi: ExtensionAPI) {
         signal,
       }),
     loadCachedModels: () => loadCachedCommandCodeModels(modelsCachePath),
-    createProviderConfig: (models) => createProviderConfig(models, apiBase, transport.stream),
+    createProviderConfig: (models) => {
+      baseCatalog = models
+      const config = createProviderConfig(models, apiBase, transport.stream)
+      // Keep the ZDR mirror in step with the base catalog, and register it
+      // before pi restores a session model so a ZDR selection is never unknown
+      // on startup.
+      registerZdrProvider()
+      return config
+    },
     getTransport: transport.getTransport,
   })
 

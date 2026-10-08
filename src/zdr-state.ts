@@ -19,6 +19,10 @@
  * ZDR catalog, and only the extension knows when they change, so it calls back
  * to have the catalog refreshed.
  *
+ * It also publishes a blocker: a per-request reason the transport throws instead
+ * of sending. That is what stops an armed session stuck on the non-ZDR provider
+ * from leaking, since the header decider alone would only strip the header.
+ *
  * It also publishes how the ZDR provider resolves its API key. That provider
  * has no credential of its own, so it borrows the `commandcode` credential,
  * which pi refreshes when the OAuth token expires.
@@ -30,11 +34,17 @@
 import { COMMAND_CODE_ZDR_PROVIDER } from "./providers.ts"
 
 const DECIDER_KEY = Symbol.for("pi-commandcode-provider.zdr-decider")
+const BLOCKER_KEY = Symbol.for("pi-commandcode-provider.zdr-blocker")
 const EXCLUDED_KEY = Symbol.for("pi-commandcode-provider.zdr-excluded")
 const REPUBLISH_KEY = Symbol.for("pi-commandcode-provider.zdr-republish")
 const KEY_RESOLVER_KEY = Symbol.for("pi-commandcode-provider.zdr-key-resolver")
 
 type ZdrDecider = (modelId: string, provider?: string) => boolean
+type ZdrBlocker = (
+  modelId: string,
+  provider: string | undefined,
+  sendZdr: boolean,
+) => string | undefined
 type ZdrKeyResolver = () => Promise<string | undefined>
 
 /** Publish the per-model header decision, or clear it to fall back to the environment. */
@@ -60,6 +70,35 @@ export function commandCodeZdrFor(
   if (typeof decider === "function") return (decider as ZdrDecider)(modelId, provider)
   if (env.CMD_ZDR === "1" || env.COMMANDCODE_ZDR === "1") return true
   return provider === COMMAND_CODE_ZDR_PROVIDER
+}
+
+/**
+ * Publish the request-blocking policy, or clear it so nothing is blocked.
+ *
+ * This is separate from the header decider because a blocked request must not
+ * leave at all, not merely go out without the header. The extension publishes
+ * it while ZDR is armed.
+ */
+export function setCommandCodeZdrBlocker(blocker: ZdrBlocker | undefined): void {
+  if (blocker) (globalThis as Record<symbol, unknown>)[BLOCKER_KEY] = blocker
+  else delete (globalThis as Record<symbol, unknown>)[BLOCKER_KEY]
+}
+
+/**
+ * Why this request must not be sent, or `undefined` when it may proceed. The
+ * provider transport calls this after the header decider and throws the reason
+ * instead of sending. It receives that decision so the check does not consume
+ * the one-shot release a second time. With no published blocker nothing is ever
+ * blocked.
+ */
+export function commandCodeZdrBlockReason(
+  modelId: string,
+  provider: string | undefined,
+  sendZdr: boolean,
+): string | undefined {
+  const blocker = (globalThis as Record<symbol, unknown>)[BLOCKER_KEY]
+  if (typeof blocker !== "function") return undefined
+  return (blocker as ZdrBlocker)(modelId, provider, sendZdr)
 }
 
 /** Publish the model ids the ZDR provider catalog must not offer. */

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Register the `commandcode-zdr` provider when the extension loads, not only on `session_start`. pi picks the model to restore before it emits `session_start`, so a session whose last model was a ZDR model warned that it could not restore it and fell back to another provider. The early provider mirrors the same definitions as the base provider until the first session context exists, then follows the live `commandcode` catalog.
+- Await the ZDR provider switch on `session_start`, so the first request of a resumed or newly armed session uses the ZDR provider instead of racing the switch and leaking the context without the header. When the switch cannot complete, the provider transport now refuses to send on the plain `commandcode` provider: rpc, print and json sessions block, and the terminal UI asks whether to continue without ZDR for the session. A manual pick to the plain provider in the terminal UI counts as that same consent and holds until the session leaves the armed state. Virtual models such as `jev/auto` are armed too, since they can route to a Command Code model, and the transport gate enforces on the concrete routed model.
 - Show the usage widget on the `commandcode-zdr` provider as well as `commandcode`, since both catalogs share one Command Code account and the same quota.
 - Render the `commandcode-zdr.armed` session entry in the transcript, so a branch shows where ZDR was armed and by what, instead of only a notification and a provider switch.
 - Gate ZDR arming on the active provider: zone touches on a non-Command-Code provider (for example `claude-bridge`) no longer append an armed entry, set `COMMANDCODE_ZDR_ARMED`, or arm the session, since the header is only ever sent to Command Code.
