@@ -1,10 +1,10 @@
 /**
  * Command Code usage widget and settings.
  *
- * Shows remaining 5-hour and weekly usage below the editor while the
- * `commandcode` provider is active. Refreshes on session start, model change,
- * and turn settle, with a short throttle so idle sessions do not hammer the
- * billing endpoints.
+ * Shows remaining 5-hour and weekly usage below the editor while either
+ * Command Code provider (`commandcode` or `commandcode-zdr`) is active.
+ * Refreshes on session start, model change, and turn settle, with a short
+ * throttle so idle sessions do not hammer the billing endpoints.
  *
  * The snapshot comes from the same alpha endpoints `/commandcode:quota` reads,
  * through the shared quota layer.
@@ -27,6 +27,7 @@ import { getConfiguredApiKey } from "./src/api-key.ts"
 import { pickCommandCodeApiKey } from "./src/converters.ts"
 import { createDiskQuotaAccountCache } from "./src/quota-account-cache.ts"
 import { commandCodeAlphaBase, commandCodeEnvHeaders } from "./src/quota-env.ts"
+import { isCommandCodeProvider } from "./src/providers.ts"
 import { fetchCommandCodeQuota } from "./src/quota.ts"
 import type { QuotaAccountCache } from "./src/quota-types.ts"
 import {
@@ -158,7 +159,10 @@ export default function commandCodeUsage(pi: ExtensionAPI) {
   }
 
   function setProvider(ctx: ExtensionContext): void {
-    providerActive = ctx.model?.provider === PROVIDER
+    // The ZDR provider shares the Command Code account, so both catalogs show
+    // the same usage. The quota fetch always resolves the `commandcode`
+    // credential, which the ZDR provider delegates to as well.
+    providerActive = isCommandCodeProvider(ctx.model?.provider)
     if (!providerActive) latest = undefined
   }
 
