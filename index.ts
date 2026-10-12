@@ -33,6 +33,7 @@ import {
   loadCommandCodeModels,
   MODEL_EFFORTS,
   thinkingMetadataForModel,
+  type CommandCodeApi,
   type CommandCodeModel,
 } from "./src/models.ts"
 import { getApiKey as getOAuthApiKey, login, refreshToken } from "./src/oauth.ts"
@@ -43,6 +44,7 @@ import { createDiskQuotaAccountCache } from "./src/quota-account-cache.ts"
 import { alphaApiBase, commandCodeEnvHeaders } from "./src/quota-env.ts"
 import { formatQuota } from "./src/quota-format.ts"
 import type { CommandCodeQuota, QuotaAccountCache } from "./src/quota-types.ts"
+import { normalizeCommandCodeResponsesResponse } from "./src/responses-stream.ts"
 import { createCommandCodeRuntime } from "./src/runtime.ts"
 import { createCommandCodeUsageProvider, type UsageProvider } from "./src/usage.ts"
 import {
@@ -132,6 +134,39 @@ function commandCodeQuotaAccountCache(): QuotaAccountCache {
   return quotaAccountCache
 }
 
+type CommandCodeModelCompat = NonNullable<ProviderConfig["models"]>[number]["compat"]
+
+/**
+ * Compatibility flags per wire. Chat Completions mirrors what the Provider API
+ * accepts for open models; Responses leaves pi's defaults (store off, encrypted
+ * reasoning) and only mutes the OpenAI extras Command Code does not advertise;
+ * Anthropic keeps the existing Claude tuning.
+ */
+function compatForModel(model: CommandCodeModel): CommandCodeModelCompat {
+  if (model.api === "openai-responses") {
+    return {
+      supportsDeveloperRole: false,
+      supportsLongCacheRetention: false,
+      sessionAffinityFormat: "openai-nosession",
+    }
+  }
+  if (model.api === "anthropic-messages") {
+    return {
+      supportsEagerToolInputStreaming: false,
+      supportsLongCacheRetention: false,
+      supportsCacheControlOnTools: false,
+      supportsToolReferences: false,
+      ...(model.reasoning ? { forceAdaptiveThinking: true } : {}),
+    }
+  }
+  return {
+    supportsStore: false,
+    supportsDeveloperRole: false,
+    supportsReasoningEffort: MODEL_EFFORTS[model.id] !== undefined,
+    maxTokensField: "max_tokens",
+  }
+}
+
 /** Map the Command Code catalog to pi model definitions, shared by both providers. */
 function createProviderModels(models: readonly CommandCodeModel[], apiBase: string) {
   return models.map((model) => ({
@@ -145,21 +180,7 @@ function createProviderModels(models: readonly CommandCodeModel[], apiBase: stri
     cost: MODEL_COSTS[model.id] ?? ZERO_MODEL_COST,
     contextWindow: model.contextWindow,
     maxTokens: model.maxTokens,
-    compat:
-      model.api === "openai-completions"
-        ? {
-            supportsStore: false,
-            supportsDeveloperRole: false,
-            supportsReasoningEffort: MODEL_EFFORTS[model.id] !== undefined,
-            maxTokensField: "max_tokens",
-          }
-        : {
-            supportsEagerToolInputStreaming: false,
-            supportsLongCacheRetention: false,
-            supportsCacheControlOnTools: false,
-            supportsToolReferences: false,
-            ...(model.reasoning ? { forceAdaptiveThinking: true } : {}),
-          },
+    compat: compatForModel(model),
   }))
 }
 
@@ -327,19 +348,44 @@ export default async function (pi: ExtensionAPI) {
   // itself. The generate transport builds its own request body and needs the
   // flat prompt and tool fields that pi 0.86+ no longer passes.
   const transcriptReaders = transcriptReadersFrom(piAiCompat)
+  // The host dispatches every Command Code model through one custom api id, so
+  // the wire each model answers on is resolved here from the catalog that
+  // `createProviderConfig` registered. Unknown ids fall back to the id rule.
+  const modelApis = new Map<string, CommandCodeApi>()
+  const resolveModelApi = (modelId: string): CommandCodeApi =>
+    modelApis.get(modelId) ?? apiForModelId(modelId)
+  let streamWarning: string | undefined
   const transport = createCommandCodeTransportRouter({
     createStream: () => new AssistantMessageEventStream(),
-    streamProvider: (model, context, options) =>
-      streamNativeProvider(
+    streamProvider: (model, context, options) => {
+      const wire = resolveModelApi(model.id)
+      const resolvedOptions: Parameters<typeof streamNativeProvider>[2] = resolveStreamOptions(
+        withZdrHeaders(model, options),
+      )
+      const nativeOptions =
+        wire === "openai-responses"
+          ? {
+              ...resolvedOptions,
+              fetch: async (...args: Parameters<typeof fetch>) =>
+                normalizeCommandCodeResponsesResponse(
+                  await (resolvedOptions?.fetch ?? fetch)(...args),
+                  (warning) => {
+                    streamWarning = warning
+                  },
+                ),
+            }
+          : resolvedOptions
+      return streamNativeProvider(
         {
           ...model,
-          api: apiForModelId(model.id),
+          api: wire,
           cost: commandCodeCostRatesAt(model.id, model.cost),
           compat: model.compatConfig ?? model.compat,
         },
         context,
-        resolveStreamOptions(withZdrHeaders(model, options)),
-      ),
+        nativeOptions,
+      )
+    },
     streamGenerate: (model, context, options) =>
       streamGenerate(
         model,
@@ -391,6 +437,7 @@ export default async function (pi: ExtensionAPI) {
     loadCachedModels: () => loadCachedCommandCodeModels(modelsCachePath),
     createProviderConfig: (models) => {
       baseCatalog = models
+      for (const model of models) modelApis.set(model.id, model.api)
       const config = createProviderConfig(models, apiBase, transport.stream)
       // Keep the ZDR mirror in step with the base catalog, and register it
       // before pi restores a session model so a ZDR selection is never unknown
@@ -399,6 +446,7 @@ export default async function (pi: ExtensionAPI) {
       return config
     },
     getTransport: transport.getTransport,
+    getStreamWarning: () => streamWarning,
   })
 
   pi.on("session_shutdown", () => {

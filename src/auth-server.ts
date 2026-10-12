@@ -99,7 +99,15 @@ export async function startAuthServer(options: AuthServerOptions = {}): Promise<
       "https://staging.commandcode.ai",
       "https://commandcode.ai",
     ]
-    const responseOrigin = allowedOrigins.includes(origin) ? origin : allowedOrigins[0]
+    // CORS response headers do not prevent cross-origin POST side effects.
+    // Reject untrusted browser origins before handling the callback.
+    if (origin && !allowedOrigins.includes(origin)) {
+      res.writeHead(403, { "Content-Type": "application/json" })
+      res.end(JSON.stringify({ success: false, error: "Origin not allowed" }))
+      return
+    }
+
+    const responseOrigin = origin || allowedOrigins[0]
     const requestedHeaders = req.headers["access-control-request-headers"]
 
     res.setHeader("Access-Control-Allow-Origin", responseOrigin)

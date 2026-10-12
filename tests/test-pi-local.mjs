@@ -19,6 +19,7 @@ const EXT_PATH = resolve(PROJECT_DIR, "index.ts")
 const COMPAT_CALLER_EXT_PATH = resolve(__dirname, "fixtures", "compat-caller-extension.ts")
 const TEST_MODEL = "gpt-5.4"
 const CLAUDE_TEST_MODEL = "claude-sonnet-4-6"
+const RESPONSES_TEST_MODEL = "deepseek/deepseek-v4.1-flash-fast"
 
 function findPiBinary() {
   if (process.env.PI_BIN) return process.env.PI_BIN
@@ -70,6 +71,10 @@ let overflowMode = false
 let overflowRequestCount = 0
 let modelsDelayMs = 0
 let includeRefreshedModel = false
+let includeResponsesModel = false
+// When set, the Responses mock holds the reasoning item open until the test
+// resolves this promise, proving deltas arrive before the item completes.
+let responsesReasoningGate
 
 function modelCatalog() {
   const data = [
@@ -80,6 +85,7 @@ function modelCatalog() {
       owned_by: "command-code",
       name: "GPT 5.4",
       context_length: 1_000_000,
+      supported_endpoints: ["/chat/completions"],
     },
     {
       id: CLAUDE_TEST_MODEL,
@@ -88,6 +94,7 @@ function modelCatalog() {
       owned_by: "command-code",
       name: "Claude Sonnet 4.6",
       context_length: 200_000,
+      supported_endpoints: ["/messages"],
     },
     {
       id: "cc-second-model",
@@ -96,8 +103,22 @@ function modelCatalog() {
       owned_by: "command-code",
       name: "Qwen 3.7 Max",
       context_length: 1_000_000,
+      supported_endpoints: ["/chat/completions"],
     },
   ]
+  // The Responses mock model is only served to the Responses routing test:
+  // the RPC lifecycle test below asserts exact catalog counts (3, then 4).
+  if (includeResponsesModel) {
+    data.push({
+      id: RESPONSES_TEST_MODEL,
+      object: "model",
+      created: 1779824324,
+      owned_by: "command-code",
+      name: "DeepSeek V4.1 Flash Fast",
+      context_length: 1_000_000,
+      supported_endpoints: ["/chat/completions", "/responses"],
+    })
+  }
   if (includeRefreshedModel) {
     data.push({
       id: "cc-refreshed-model",
@@ -109,6 +130,109 @@ function modelCatalog() {
     })
   }
   return { object: "list", data }
+}
+
+/** Minimal OpenAI Responses stream: one assistant text message, then a terminal event. */
+async function writeResponsesStream(res, text) {
+  const item = {
+    type: "message",
+    id: "msg_mock",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text, annotations: [] }],
+  }
+  const send = (event, name) =>
+    res.write(`${name ? `event: ${name}\n` : ""}data: ${JSON.stringify(event)}\n\n`)
+  send({
+    type: "response.created",
+    response: { id: "resp_mock", object: "response", status: "in_progress", output: [] },
+  })
+  const reasoningItem = {
+    type: "reasoning",
+    id: "rs_mock",
+    summary: [],
+    content: [{ type: "reasoning_text", text: "We think" }],
+  }
+  const textIndex = responsesReasoningGate ? 1 : 0
+  if (responsesReasoningGate) {
+    send({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { type: "reasoning", id: "rs_mock", summary: [], content: [] },
+    })
+    send(
+      {
+        type: "response.reasoning.delta",
+        output_index: 0,
+        content_index: 0,
+        item_id: "rs_mock",
+        delta: "We",
+      },
+      "response.reasoning.delta",
+    )
+    send(
+      {
+        type: "response.reasoning.delta",
+        output_index: 0,
+        content_index: 0,
+        item_id: "rs_mock",
+        delta: " think",
+      },
+      "response.reasoning.delta",
+    )
+    await responsesReasoningGate
+    send({
+      type: "response.reasoning.done",
+      output_index: 0,
+      content_index: 0,
+      item_id: "rs_mock",
+      text: "We think",
+    })
+    send({ type: "response.output_item.done", output_index: 0, item: reasoningItem })
+  }
+  send({
+    type: "response.output_item.added",
+    output_index: textIndex,
+    item: {
+      type: "message",
+      id: "msg_mock",
+      role: "assistant",
+      status: "in_progress",
+      content: [],
+    },
+  })
+  send({
+    type: "response.output_text.delta",
+    output_index: textIndex,
+    content_index: 0,
+    item_id: "msg_mock",
+    delta: text,
+  })
+  send({
+    type: "response.output_text.done",
+    output_index: textIndex,
+    content_index: 0,
+    item_id: "msg_mock",
+    text,
+  })
+  send({ type: "response.output_item.done", output_index: textIndex, item })
+  send({
+    type: "response.completed",
+    response: {
+      id: "resp_mock",
+      object: "response",
+      status: "completed",
+      output: responsesReasoningGate ? [reasoningItem, item] : [item],
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        total_tokens: 2,
+        input_tokens_details: { cached_tokens: 0 },
+        output_tokens_details: { reasoning_tokens: 0 },
+      },
+    },
+  })
+  res.end()
 }
 
 const server = createServer((req, res) => {
@@ -130,9 +254,10 @@ const server = createServer((req, res) => {
   }
 
   const isOpenAIRequest = req.method === "POST" && pathname === "/provider/v1/chat/completions"
+  const isResponsesRequest = req.method === "POST" && pathname === "/provider/v1/responses"
   const isAnthropicRequest = req.method === "POST" && pathname === "/provider/v1/messages"
   const isGenerateRequest = req.method === "POST" && pathname === "/alpha/generate"
-  if (!isOpenAIRequest && !isAnthropicRequest && !isGenerateRequest) {
+  if (!isOpenAIRequest && !isResponsesRequest && !isAnthropicRequest && !isGenerateRequest) {
     res.writeHead(404)
     res.end("Not found")
     return
@@ -199,6 +324,10 @@ const server = createServer((req, res) => {
           ? "compaction-summary"
           : "overflow-recovered"
       : "mock-pi-ok"
+    if (isResponsesRequest) {
+      writeResponsesStream(res, text).catch((error) => res.destroy(error))
+      return
+    }
     if (isAnthropicRequest) {
       res.write(
         `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "mock", type: "message", role: "assistant", content: [], model: CLAUDE_TEST_MODEL, stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } })}\n\n`,
@@ -271,10 +400,14 @@ function runPi(args, timeoutOrOptions = 30_000) {
       env: childEnv,
       stdio: ["ignore", "pipe", "pipe"],
     })
+    const waitForClose = rpcChildCloseWaiter(child)
     let stdout = ""
     let stderr = ""
-    const timer = setTimeout(() => {
+    let timedOut = false
+    const timer = setTimeout(async () => {
+      timedOut = true
       child.kill()
+      await waitForClose()
       resolve({
         code: -1,
         stdout,
@@ -289,9 +422,22 @@ function runPi(args, timeoutOrOptions = 30_000) {
     })
     child.on("close", (code) => {
       clearTimeout(timer)
-      resolve({ code, stdout, stderr })
+      if (!timedOut) resolve({ code, stdout, stderr })
     })
   })
+}
+
+/** Observe close before shutdown so cleanup never races session-file writes. */
+function rpcChildCloseWaiter(child) {
+  const closed = new Promise((resolve) => child.once("close", resolve))
+  return async () => {
+    const timer = setTimeout(() => child.kill("SIGKILL"), 5_000)
+    try {
+      await closed
+    } finally {
+      clearTimeout(timer)
+    }
+  }
 }
 
 async function runRpcQuery(
@@ -299,6 +445,7 @@ async function runRpcQuery(
   promptMessage = "say mock token",
   extraArgs = [],
   promptFields = {},
+  options = {},
 ) {
   const child = spawn(
     PI_BIN,
@@ -311,7 +458,7 @@ async function runRpcQuery(
       "--provider",
       "commandcode",
       "--model",
-      TEST_MODEL,
+      options.model ?? TEST_MODEL,
       ...extraArgs,
     ],
     {
@@ -321,6 +468,7 @@ async function runRpcQuery(
     },
   )
 
+  const waitForClose = rpcChildCloseWaiter(child)
   let stdout = ""
   let stderr = ""
   let buffer = ""
@@ -367,6 +515,7 @@ async function runRpcQuery(
         try {
           const event = JSON.parse(trimmed)
           events.push(event)
+          options.onEvent?.(event)
           if (event.type === "response" && event.id === "prompt-1" && event.success === true) {
             sawPromptAccepted = true
           }
@@ -394,6 +543,7 @@ async function runRpcQuery(
   })
 
   const ok = await done
+  await waitForClose()
   return {
     ok,
     stdout,
@@ -426,6 +576,7 @@ async function runRpcExtensionCommands(timeoutMs = 30_000) {
     },
   )
 
+  const waitForClose = rpcChildCloseWaiter(child)
   let buffer = ""
   let stderr = ""
   const events = []
@@ -537,6 +688,7 @@ async function runRpcExtensionCommands(timeoutMs = 30_000) {
     }
   } finally {
     child.kill()
+    await waitForClose()
   }
 }
 
@@ -563,6 +715,7 @@ async function runRpcCompatCall(timeoutMs = 30_000) {
     },
   )
 
+  const waitForClose = rpcChildCloseWaiter(child)
   let buffer = ""
   let stderr = ""
 
@@ -606,6 +759,7 @@ async function runRpcCompatCall(timeoutMs = 30_000) {
     return { message: await notification, stderr }
   } finally {
     child.kill()
+    await waitForClose()
   }
 }
 
@@ -630,6 +784,7 @@ async function runRpcOverflowRecovery(timeoutMs = 60_000) {
     },
   )
 
+  const waitForClose = rpcChildCloseWaiter(child)
   let buffer = ""
   let stderr = ""
   const events = []
@@ -686,6 +841,7 @@ async function runRpcOverflowRecovery(timeoutMs = 60_000) {
   })
 
   const outcome = await result
+  await waitForClose()
   return {
     ...outcome,
     requests: overflowRequestCount,
@@ -982,6 +1138,107 @@ try {
   assert.equal(requestCount, 0, JSON.stringify(lastRequestHeaders))
   assert.doesNotMatch(noKeyPrint.stdout + noKeyPrint.stderr, /\$COMMAND_CODE_API_KEY/)
 
+  console.log("[pi-local] Responses endpoint for a model advertising /responses")
+  requestCount = 0
+  // Drop the shared models cache so this step performs a live refresh that
+  // includes the gated Responses mock model (earlier steps cached the
+  // 3-model catalog, where the model is unknown and falls back to completions).
+  rmSync(join(agentDir, "commandcode-models.json"), { force: true })
+  includeResponsesModel = true
+  const responsesPrint = await runPi(
+    [
+      "--no-extensions",
+      "-e",
+      EXT_PATH,
+      "-p",
+      "say mock token",
+      "--provider",
+      "commandcode",
+      "--model",
+      RESPONSES_TEST_MODEL,
+    ],
+    30_000,
+  )
+  assert.equal(responsesPrint.code, 0, responsesPrint.stderr)
+  assert.match(responsesPrint.stdout, /mock-pi-ok/)
+  assert.equal(requestCount, 1)
+  assert.equal(lastRequestPath, "/provider/v1/responses")
+  assert.equal(lastRequestBody?.model, RESPONSES_TEST_MODEL)
+  assert.equal(lastRequestBody?.stream, true)
+  assert.ok(Array.isArray(lastRequestBody?.input), "Responses request should use the input array")
+
+  console.log("[pi-local] Responses reasoning deltas stream before the item completes")
+  requestCount = 0
+  let releaseResponsesReasoningGate
+  responsesReasoningGate = new Promise((resolve) => {
+    releaseResponsesReasoningGate = resolve
+  })
+  const thinkingDeltas = []
+  let sawThinkingEndBeforeGate = false
+  let thinkingEndCount = 0
+  try {
+    const reasoningRpc = await runRpcQuery(
+      30_000,
+      "say mock token",
+      ["--thinking", "high"],
+      {},
+      {
+        model: RESPONSES_TEST_MODEL,
+        onEvent: (event) => {
+          if (event.type !== "message_update") return
+          const assistantEvent = event.assistantMessageEvent
+          if (assistantEvent?.type === "thinking_delta") {
+            thinkingDeltas.push(assistantEvent.delta)
+            if (thinkingDeltas.length === 2) releaseResponsesReasoningGate()
+          } else if (assistantEvent?.type === "thinking_end") {
+            thinkingEndCount += 1
+            if (thinkingDeltas.length < 2) sawThinkingEndBeforeGate = true
+          }
+        },
+      },
+    )
+    assert.equal(
+      reasoningRpc.ok,
+      true,
+      JSON.stringify(
+        {
+          stderr: reasoningRpc.stderr,
+          stdout: reasoningRpc.stdout,
+          events: reasoningRpc.events.slice(-10),
+        },
+        null,
+        2,
+      ),
+    )
+    assert.equal(sawThinkingEndBeforeGate, false)
+    assert.deepEqual(thinkingDeltas, ["We", " think"])
+    assert.equal(thinkingEndCount, 1)
+    const thinkingEnd = reasoningRpc.events.find(
+      (event) =>
+        event.type === "message_update" && event.assistantMessageEvent?.type === "thinking_end",
+    )
+    assert.equal(thinkingEnd?.assistantMessageEvent?.content, "We think")
+    const finalMessage = [...reasoningRpc.events]
+      .reverse()
+      .find((event) => event.type === "message_end" && event.message?.role === "assistant")
+    const thinkingBlock = finalMessage?.message?.content?.find((block) => block.type === "thinking")
+    assert.equal(thinkingBlock?.thinking, "We think")
+    assert.equal(
+      finalMessage?.message?.content?.some(
+        (block) => block.type === "text" && block.text.includes("mock-pi-ok"),
+      ),
+      true,
+    )
+    assert.equal(lastRequestPath, "/provider/v1/responses")
+    assert.equal(requestCount, 1)
+    assert.notEqual(finalMessage?.message?.stopReason, "error")
+  } finally {
+    releaseResponsesReasoningGate()
+    responsesReasoningGate = undefined
+  }
+
+  includeResponsesModel = false
+
   console.log("[pi-local] Claude request through Anthropic Messages endpoint")
   requestCount = 0
   const claudePrint = await runPi(
@@ -1084,11 +1341,21 @@ try {
   assert.equal(overflowRpc.sawCompactionRetry, true, JSON.stringify(overflowRpc))
   assert.equal(overflowRpc.stderrHasSecrets, false)
   overflowMode = false
-
-  console.log("[pi-local] PASS")
 } finally {
   await new Promise((resolve) => server.close(resolve))
-  // RPC children can still flush session files while exiting after SIGTERM.
-  // Retry transient ENOTEMPTY, but keep a persistent cleanup failure fatal.
-  rmSync(tempHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  // Children have closed; retain fresh removal attempts as a filesystem
+  // backstop because maxRetries behavior on ENOTEMPTY varies across Node versions.
+  let lastCleanupError
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    try {
+      rmSync(tempHome, { recursive: true, force: true })
+      lastCleanupError = undefined
+      break
+    } catch (error) {
+      lastCleanupError = error
+      await new Promise((resolve) => setTimeout(resolve, 500))
+    }
+  }
+  if (lastCleanupError) throw lastCleanupError
 }
+console.log("[pi-local] PASS")

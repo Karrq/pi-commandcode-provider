@@ -86,9 +86,19 @@ Open `/model` and select one of the models provided by Command Code. Model avail
 
 Other extensions that stream with the active Command Code model, such as background agents or memory workers, use the same connection and the same credentials as the chat, so their requests count against your Command Code usage.
 
+### Endpoint selection
+
+The Provider API serves models on different wires, and `/provider/v1/models` advertises the routes each model answers on through its `supported_endpoints` field. The provider maps that to the matching wire:
+
+- Claude models answer on `/provider/v1/messages` only.
+- Models advertising `/responses` use the OpenAI Responses wire on `/provider/v1/responses`.
+- Every other model uses OpenAI Chat Completions on `/provider/v1/chat/completions`.
+
+A model whose catalog entry omits `supported_endpoints` keeps Chat Completions, which every non-Claude model serves, so discovery keeps working when the field is absent. The selection is applied per model, so a catalog that mixes wires streams each model correctly.
+
 ### Reasoning support
 
-Reasoning capability and selectable effort levels follow the official CLI catalog independently. Models can therefore be marked as reasoning-capable even when Command Code chooses their depth automatically. Models with explicit effort support register a model-specific `thinkingLevelMap`, so pi and OMP expose only valid levels. For a few reasoning models the CLI catalog ships no effort levels although the endpoint accepts `reasoning_effort`; `src/commandcode-catalog-overrides.ts` adds a manual level set for those (currently `meta/muse-spark-1.1`, `meta/muse-spark-1.2`, and `meta/muse-spark-1.2-contributor`) on top of the generated catalog. The catalog sync removes an override as soon as upstream publishes its own levels. Pi's native OpenAI- and Anthropic-compatible providers translate the selected level for Provider API accounts; the existing Command Code generate transport sends the matching `reasoning_effort` for Go accounts.
+Reasoning capability and selectable effort levels follow the official CLI catalog independently. Models can therefore be marked as reasoning-capable even when Command Code chooses their depth automatically. Models with explicit effort support register a model-specific `thinkingLevelMap`, so pi and OMP expose only valid levels. For a few reasoning models the CLI catalog ships no effort levels although the endpoint accepts `reasoning_effort`; `src/commandcode-catalog-overrides.ts` adds a manual level set for those on top of the generated catalog (currently empty because upstream publishes every level). The catalog sync removes an override as soon as upstream publishes its own levels. Pi's native OpenAI- and Anthropic-compatible providers translate the selected level for Provider API accounts; the existing Command Code generate transport sends the matching `reasoning_effort` for Go accounts.
 
 List Command Code models from the terminal:
 
@@ -123,7 +133,7 @@ When a valid cache exists, the provider registers the cached catalog immediately
 While pi is running, use these provider commands without restarting:
 
 - `/commandcode:refresh` fetches and re-registers the current model catalog. Overlapping refreshes are coalesced, and a failed refresh keeps the last valid catalog active.
-- `/commandcode:status` shows redacted discovery diagnostics, including the source, model count, timestamps, cache path, endpoint, and warning.
+- `/commandcode:status` shows redacted discovery diagnostics, including the source, model count, timestamps, cache path, endpoint, and warning. If a Responses reasoning event has an unsupported shape, a separate stream warning remains visible until the extension is reloaded or the host restarts. The event is preserved unchanged; no reasoning text is included in the warning.
 - `/commandcode:quota` shows your Command Code account usage and quota: the 30-day, 5-hour, and weekly windows as remaining-percentage bars with reset times, with the remaining monthly credits next to the 30-day bar. The report is appended as a session entry so it persists in the transcript and is not sent to the model.
 
 The `/commandcode:quota` command reads from the Command Code alpha usage endpoints (the same ones the `cmd` CLI `/usage` command uses): `whoami`, `billing/credits`, `billing/subscriptions`, and `usage/summary`. It authenticates with the same API key the provider already uses. After `whoami` resolves the org, the three billing endpoints are fetched together; the command does not display the billing-period request or token totals. The resolved account identity is cached on disk beside the agent's other Command Code files, keyed by a SHA-256 of the API key, so repeated fetches skip `whoami`; the entry has no time-based expiry and is dropped after a failed request. The monthly window is derived, not reported: `billing/credits` carries the remaining balance but no cap, so the cap is the remaining balance plus the billing-period spend from `usage/summary`, and its reset is the subscription's period end. If the command cannot reach those endpoints or an endpoint schema changes, unavailable sections are reported explicitly instead of being displayed as zero usage. In TUI mode the report is rendered from the session entry; other hosts get a plain-text notification so it works across pi and compatible hosts such as OMP.
@@ -141,7 +151,7 @@ The following environment variables are intended for tests, local mocks, and com
 
 ## Image input
 
-The provider advertises image input only for models marked with the `image` input modality in the official Command Code CLI model catalog. The capability snapshot currently follows `command-code@1.72.4`; unknown models default to text-only until their upstream metadata is reviewed. A daily GitHub Actions job synchronizes the CLI version, image capabilities, reasoning flags, reasoning efforts, and model-specific output limits with the latest published CLI package, also dropping manual effort overrides that upstream has published itself, and opens or updates a reviewable pull request when they change. Pricing remains manually reviewed because temporary promotions and long-context tiers require explicit review.
+The provider advertises image input only for models marked with the `image` input modality in the official Command Code CLI model catalog. The capability snapshot currently follows `command-code@1.79.2`; unknown models default to text-only until their upstream metadata is reviewed. A daily GitHub Actions job synchronizes the CLI version, image capabilities, reasoning flags, reasoning efforts, and model-specific output limits with the latest published CLI package, also dropping manual effort overrides that upstream has published itself, and opens or updates a reviewable pull request when they change. Pricing remains manually reviewed because temporary promotions and long-context tiers require explicit review.
 
 For vision-capable models, Pi's native provider adapters forward image blocks from user messages and tool results using the documented OpenAI or Anthropic message schema. Unknown and text-only models remain marked text-only in Pi.
 
@@ -163,6 +173,8 @@ The tool is read-only and marks itself `openWorldHint`. It is separate from pi's
 The Command Code Provider API does not currently include prices in its model catalog. This extension therefore keeps a static table for models with known prices so pi and OMP can display estimated request costs. DeepSeek V4 uses time-dependent rates: the extension applies the documented 2x peak rates on weekdays from 01:00-04:00 and 06:00-10:00 UTC, and off-peak rates at all other times, including the entire weekend. The same request-time selection is used by the native Provider API path and the legacy generate fallback.
 
 Models missing from that table display zero cost in pi. This does **not** mean that Command Code will bill the request at zero. The Command Code Usage page remains authoritative for each request. Check the current [Command Code pricing](https://commandcode.ai/docs/resources/pricing-limits) before relying on the displayed value.
+
+A read-only companion check, `npm run check:commandcode-pricing`, compares the live Provider API catalog and the official pricing page with the static table. It never writes prices: exit code `0` means every compared rate matches, `1` means drift or an expired promotion needs manual review, and `2` means the price could not be checked. The daily catalog workflow and applicable pull requests publish the Markdown report to the GitHub Actions summary. The pricing page has no public pricing API, so the check parses its private Next.js Flight payload; if that format changes the check fails loudly instead of reporting a false pass, and prices stay manually reviewed.
 
 ## Update and remove
 

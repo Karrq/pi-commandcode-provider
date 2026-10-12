@@ -111,6 +111,50 @@ describe("startAuthServer()", () => {
     await waitForClose(server)
   })
 
+  it("rejects untrusted browser origins before handling callback errors", async () => {
+    const { server, port, waitForCallback } = await startAuthServer({
+      startPort: 0,
+      expectedState: "trusted-state",
+    })
+
+    // text/plain avoids preflight, so CORS response headers alone cannot protect side effects.
+    const rejected = await fetch(`http://127.0.0.1:${port}/callback`, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain", Origin: "https://untrusted.example" },
+      body: JSON.stringify({ error: "access_denied", error_description: "forged cancellation" }),
+    })
+    assert.equal(rejected.status, 403)
+    assert.equal(server.listening, true)
+
+    const accepted = await fetch(`http://127.0.0.1:${port}/callback`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: "https://commandcode.ai" },
+      body: JSON.stringify({
+        apiKey: "user_legitimate",
+        state: "trusted-state",
+        userId: "user_123",
+        userName: "Test User",
+        keyName: "test-key",
+      }),
+    })
+    assert.equal(accepted.status, 200)
+    assert.equal((await waitForCallback).apiKey, "user_legitimate")
+    await waitForClose(server)
+  })
+
+  it("rejects untrusted browser preflights", async () => {
+    const { server, port } = await startAuthServer({ startPort: 0 })
+    const response = await fetch(`http://127.0.0.1:${port}/callback`, {
+      method: "OPTIONS",
+      headers: {
+        Origin: "https://untrusted.example",
+        "Access-Control-Request-Headers": "content-type",
+      },
+    })
+    assert.equal(response.status, 403)
+    server.close()
+  })
+
   it("rejects when the callback indicates access_denied", async () => {
     const { server, port, waitForCallback } = await startAuthServer({ startPort: 0 })
 

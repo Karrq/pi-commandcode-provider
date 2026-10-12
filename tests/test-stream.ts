@@ -8,7 +8,11 @@ import { after, before, beforeEach, describe, it } from "node:test"
 
 import { COMMAND_CODE_CLI_VERSION } from "../src/commandcode-catalog.ts"
 import type { AssistantMessageEvent } from "../src/core.ts"
-import { MODEL_EFFORTS, thinkingLevelMapForEfforts } from "../src/models.ts"
+import {
+  MODEL_EFFORTS,
+  thinkingLevelMapForEfforts,
+  thinkingMetadataForModel,
+} from "../src/models.ts"
 import {
   collectEvents,
   createTestDeps,
@@ -777,6 +781,42 @@ describe("streamCommandCode — request serialization", () => {
     assert.equal(headers["x-session-id"], undefined)
   })
 
+  it("replays previous assistant reasoning in the generate request history", async () => {
+    server.mockResponse({
+      type: "success",
+      events: [JSON.stringify({ type: "finish", finishReason: "stop" })],
+    })
+    const { streamCommandCode } = createTestDeps({ apiBase: server.baseUrl() })
+
+    await collectEvents(
+      streamCommandCode(
+        makeModel(),
+        makeContext({
+          messages: [
+            { role: "user", content: "think of a number" },
+            {
+              role: "assistant",
+              content: [
+                { type: "thinking", thinking: "my number is 57" },
+                { type: "text", text: "ready" },
+              ],
+            },
+            { role: "user", content: "is it bigger than 50?" },
+          ],
+        }),
+        { apiKey: "mock-key" },
+      ),
+    )
+
+    assert.deepEqual(objectAt(server.lastRequestBody(), ["params", "messages", "1"]), {
+      role: "assistant",
+      content: [
+        { type: "reasoning", text: "my number is 57" },
+        { type: "text", text: "ready" },
+      ],
+    })
+  })
+
   it("normalizes nullable tool parameters only for Gemini on the generate wire (#99)", async () => {
     server.mockResponse({
       type: "success",
@@ -953,10 +993,15 @@ describe("streamCommandCode — request serialization", () => {
   })
 
   it("omits reasoning_effort for off, unsupported, and unknown reasoning levels", async () => {
+    // Build from the canonical metadata so this pins the `thinking.effortMap`
+    // path that `mappedReasoningEffort` prefers, not only the legacy
+    // `thinkingLevelMap` fallback exercised above.
+    const metadata = thinkingMetadataForModel("deepseek/deepseek-v4-flash")
+    assert.ok(metadata, "deepseek-v4-flash should have reasoning metadata")
     const model = makeModel({
       id: "deepseek/deepseek-v4-flash",
       reasoning: true,
-      thinkingLevelMap: thinkingLevelMapForEfforts(MODEL_EFFORTS["deepseek/deepseek-v4-flash"]),
+      ...metadata,
     })
 
     for (const reasoning of ["off", "low"] as const) {

@@ -12,6 +12,47 @@
 - Ask before arming ZDR on a low-confidence Jev answer that leans toward reading a zone. Previously any probability at or above 0.5 armed immediately, so a command the classifier could not reason about (for example a script it had no context for) armed without the user being able to run it as-is.
 - Add a `web_search` tool as a separate extension entry, usable with any active model while a Command Code account is logged in. It calls Command Code's search route with the stored credentials and repairs two out-of-contract inputs, reporting each as a `Note:` in the result: a `numResults` above 10 is merged across calls, and an `allowed_domains` plus `blocked_domains` pair keeps the intersection by applying the allow list upstream and removing the block list locally.
 
+## 0.7.7 - 2026-10-11
+
+- Recognize the `off` reasoning effort now published for the DeepSeek V4 and V4.1 models, so the catalog parser no longer rejects it and the generate transport never forwards `off` as `reasoning_effort`. The Provider API and Oh My Pi adapters translate the level from the model's thinking metadata on their own wire.
+- Refresh the static capability snapshot to `command-code@1.79.2`: add `claude-haiku-5-5`, `mistral/mistral-large-4` (image input, 262K output limit), and the free `stealth/glyph-cluster:free`; retire `stealth/pixel-canary` and `stealth/space-bunny-alpha`.
+- Add reviewed display pricing for the refreshed catalog — `claude-haiku-5-5` with its 100K long-context tier, `mistral/mistral-large-4`, and the free `stealth/glyph-cluster:free` — drop the retired `stealth/space-bunny-alpha`, and correct the `claude-sonnet-5-5` cache-read rate to $0.10 per million tokens, verified against the official pricing page on 2026-10-09. The snapshot now covers all 87 advertised models.
+- Fix `400 input[N].call_id` failures on the `/alpha/generate` fallback by shortening compound Responses tool-call ids (`<call_id>|<item_id>`, 73 characters in the reported session) to the 64-character wire limit. The mapping is deterministic per request and shared by tool calls and their results, so pairing is preserved and distinct ids never collide; short ids pass through unchanged and the Provider API path is untouched ([#141](https://github.com/patlux/pi-commandcode-provider/issues/141)).
+- Replay prior assistant reasoning on the generate transport so the model can see its own earlier thinking on follow-up turns, matching the Command Code CLI's `/alpha/generate` wire (`toWireMessages` in `command-code@1.79.2`), which replays every thinking block as a `reasoning` part with no model check and no signature. Prior reasoning was dropped in 0.5.0, which made multi-turn tasks whose state lives only in thinking — plans, games, consistency checks — silently re-decide on the fallback transport.
+- Reject local OAuth callback requests that carry an untrusted browser `Origin` before any callback payload is processed, so a cross-origin forged `text/plain` POST (including a forged `access_denied`) can no longer terminate a pending browser login ([#149](https://github.com/patlux/pi-commandcode-provider/pull/149)). Origin-less local clients, the trusted Command Code/localhost origins, and the state-mismatch flow are unchanged.
+
+### Contributors
+
+- @sandexzx — refreshed the Command Code catalog to `1.79.2`, taught the parser the new `off` reasoning effort, and added the matching reviewed pricing (#145).
+- @szpoont — reported the generate fallback's `call_id` length failures with a reproducible session export (#141).
+- @LongLongBigInt — diagnosed the dropped assistant reasoning across generate turns and contributed the replay fix with cumulative fixtures (#146, #148).
+- @karaaslanz — hardened the local OAuth callback against forged browser origins and caught the short-ID collision edge case in the tool-call ID fix (#144, #149).
+
+## 0.7.6 - 2026-10-06
+
+- Correct the display input price for `stepfun/Step-3.5-Flash` to $0.09 per million tokens and add the `Qwen/Qwen3.6-Plus` long-context tier above 256K tokens, verified against the official pricing page on 2026-10-06. Mark the unchanged, expired `qwen-3.7-max-2x-usage` badge as reviewed in the pricing checker while keeping it visible in reports; changed deal terms and price drift still require review.
+- Restore incremental reasoning on the Provider API OpenAI Responses wire by translating Command Code's non-standard `response.reasoning.delta` events into the canonical `response.reasoning_text.delta` before they reach pi-ai, including valid trailing frames without a final blank line. Reasoning now streams while the reasoning item is still open instead of appearing only at `response.output_item.done`. Unsupported reasoning event shapes remain unchanged and produce a content-free warning in `/commandcode-status`. Reproduced with `deepseek/deepseek-v4.1-flash-fast`; standard Responses events, Chat Completions, Anthropic Messages, and the generate fallback are unchanged.
+- Add a read-only `npm run check:commandcode-pricing` command that compares the live Provider API catalog and the official pricing page against `MODEL_COSTS`, reporting missing local prices, changed base rates and context tiers, time-policy drift, and expired promotions. It runs in the daily catalog workflow and applicable pull requests, publishes its report to the Actions summary, and never edits prices.
+- Add reviewed display pricing for the October catalog additions — `claude-sonnet-5-5`, `gpt-6.1-sol` (with its 272K long-context tier), `deepseek/deepseek-v4.1-flash-fast`, and the free `inclusionai/ling-3.1-flash:free`. Apply the DeepSeek V4 weekday peak-pricing window to `deepseek/deepseek-v4.1-flash-fast`. Models absent from `MODEL_COSTS` silently fall back to a zero display cost, so the snapshot now covers all 85 advertised models.
+
+### Contributors
+
+- @sandexzx — added October catalog display pricing (#135), built the pricing-drift checker (#136), and restored incremental Responses reasoning (#138).
+
+## 0.7.5 - 2026-10-06
+
+- Harden the `test-pi-local.mjs` temp-home cleanup against transient `ENOTEMPTY` when RPC children flush session files while exiting: poll with fresh removal attempts instead of relying on `maxRetries`, whose behavior on `ENOTEMPTY` varies across Node versions. Test-only change; the 0.7.4 release run failed on this cleanup after all tests had passed.
+
+## 0.7.4 - 2026-10-05
+
+- Use the Provider API's OpenAI Responses wire (`/provider/v1/responses`) for models whose `/provider/v1/models` entry advertises `/responses`, keeping OpenAI Chat Completions for chat-only models and Anthropic Messages for Claude. The wire is resolved per model from `supported_endpoints`, falling back to Chat Completions when the catalog omits the field. This also enables prompt caching (`prompt_cache_key` is forwarded on `/responses` but ignored on `/chat/completions`): repeated prefixes bill at cache-read instead of full input price ([#132](https://github.com/patlux/pi-commandcode-provider/issues/132), [#133](https://github.com/patlux/pi-commandcode-provider/pull/133)).
+- Sweep orphaned `commandcode-models.json.<pid>.tmp` files older than one hour on the next successful catalog refresh, and use a unique temp name per attempt so concurrent hosts never share one. Hosts killed mid-write no longer accumulate temp files ([#130](https://github.com/patlux/pi-commandcode-provider/issues/130), [#131](https://github.com/patlux/pi-commandcode-provider/pull/131)).
+
+### Contributors
+
+- @Mario-pereyra — designed the OpenAI Responses wire and authored the routing implementation carried forward in #133 (#124).
+- @maxitromer — traced the missing cache key on the Provider API path and proposed the fix directions (#132).
+
 ## 0.7.3 - 2026-09-28
 
 - Register an Oh My Pi usage provider alongside the Command Code models, so OMP reports the account's 5-hour and weekly usage windows, credits remaining and used against the billing-period pool, and the current plan wherever it reads provider usage. The report is built from the same alpha endpoints and credentials `/commandcode-quota` uses rather than a second fetch, and sections the API does not report are listed as unavailable instead of being displayed as zero usage. pi has no `usage` field and ignores it ([#120](https://github.com/patlux/pi-commandcode-provider/pull/120)).

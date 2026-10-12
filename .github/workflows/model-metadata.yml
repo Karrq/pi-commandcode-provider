@@ -5,14 +5,21 @@ on:
     branches: [main]
     paths:
       - ".github/scripts/check-commandcode-model-metadata.ts"
+      - ".github/scripts/check-commandcode-pricing.ts"
       - ".github/workflows/model-metadata.yml"
       - "README.md"
+      - "package.json"
       - "src/commandcode-catalog-overrides.ts"
       - "src/commandcode-catalog.ts"
       - "src/core.ts"
+      - "src/cost.ts"
       - "src/models.ts"
+      - "src/pricing.ts"
+      - "tests/fixtures/commandcode-pricing-page-haiku-5-5.html"
+      - "tests/fixtures/commandcode-pricing-page.html"
       - "tests/test-model-metadata-check.ts"
       - "tests/test-models.ts"
+      - "tests/test-pricing-check.ts"
   schedule:
     - cron: "17 6 * * *"
   workflow_dispatch:
@@ -37,10 +44,19 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm ci
       - name: Compare with the latest Command Code CLI
+        shell: bash
         run: npm run check:commandcode-catalog | tee commandcode-catalog-report.md
       - name: Publish catalog report
         if: always()
         run: cat commandcode-catalog-report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Compare official pricing
+        if: always()
+        shell: bash
+        run: npm run check:commandcode-pricing | tee commandcode-pricing-report.md
+      - name: Publish pricing report
+        if: always()
+        run: |
+          if [ -f commandcode-pricing-report.md ]; then cat commandcode-pricing-report.md >> "$GITHUB_STEP_SUMMARY"; fi
 
   sync:
     if: github.event_name != 'pull_request'
@@ -58,6 +74,7 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm ci
       - name: Synchronize with the latest Command Code CLI
+        shell: bash
         run: npm run sync:commandcode-catalog | tee commandcode-catalog-report.md
       - name: Format and verify synchronized files
         run: |
@@ -92,3 +109,11 @@ jobs:
             src/commandcode-catalog.ts
             src/commandcode-catalog-overrides.ts
             README.md
+      - name: Compare official pricing
+        if: always()
+        shell: bash
+        run: npm run check:commandcode-pricing | tee commandcode-pricing-report.md
+      - name: Publish pricing report
+        if: always()
+        run: |
+          if [ -f commandcode-pricing-report.md ]; then cat commandcode-pricing-report.md >> "$GITHUB_STEP_SUMMARY"; fi

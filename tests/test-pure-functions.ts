@@ -4,7 +4,7 @@
  */
 
 import assert from "node:assert/strict"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, it } from "node:test"
@@ -713,9 +713,11 @@ describe("messagesToCC()", () => {
 
     assert.equal(objectAt(result, ["0", "role"]), "user")
     assert.equal(objectAt(result, ["1", "role"]), "assistant")
-    assert.equal(objectAt(result, ["1", "content", "0", "type"]), "text")
-    assert.equal(objectAt(result, ["1", "content", "1", "type"]), "tool-call")
-    assert.equal(objectAt(result, ["1", "content", "2"]), undefined)
+    assert.equal(objectAt(result, ["1", "content", "0", "type"]), "reasoning")
+    assert.equal(objectAt(result, ["1", "content", "0", "text"]), "I will read")
+    assert.equal(objectAt(result, ["1", "content", "1", "type"]), "text")
+    assert.equal(objectAt(result, ["1", "content", "2", "type"]), "tool-call")
+    assert.equal(objectAt(result, ["1", "content", "3"]), undefined)
     assert.equal(objectAt(result, ["2", "role"]), "tool")
     assert.equal(objectAt(result, ["2", "content", "0", "output", "value"]), "hello\nworld")
   })
@@ -942,7 +944,7 @@ describe("messagesToCC()", () => {
     assert.equal(objectAt(result, ["2", "content", "0", "output", "value"]), "plain result")
   })
 
-  it("drops previous assistant reasoning while preserving text and tool calls", () => {
+  it("replays previous assistant reasoning while preserving text and tool calls", () => {
     const result = messagesToCC([
       { role: "user", content: "first question" },
       {
@@ -957,12 +959,18 @@ describe("messagesToCC()", () => {
 
     assert.deepEqual(result, [
       { role: "user", content: "first question" },
-      { role: "assistant", content: [{ type: "text", text: "first answer" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "private reasoning from turn one" },
+          { type: "text", text: "first answer" },
+        ],
+      },
       { role: "user", content: "follow-up question" },
     ])
   })
 
-  it("omits assistant turns that contain only previous reasoning", () => {
+  it("keeps assistant turns that contain only previous reasoning", () => {
     const result = messagesToCC([
       { role: "user", content: "first question" },
       {
@@ -974,8 +982,23 @@ describe("messagesToCC()", () => {
 
     assert.deepEqual(result, [
       { role: "user", content: "first question" },
+      {
+        role: "assistant",
+        content: [{ type: "reasoning", text: "private reasoning" }],
+      },
       { role: "user", content: "follow-up question" },
     ])
+  })
+
+  it("replays cumulative reasoning for text-only assistant turns in a tool-enabled session (#146 fixtures)", () => {
+    const session = JSON.parse(
+      readFileSync(new URL("./fixtures/issue-146-session.json", import.meta.url), "utf8"),
+    ) as { messages: Parameters<typeof messagesToCC>[0] }
+    const expected = JSON.parse(
+      readFileSync(new URL("./fixtures/issue-146-generate-turn3.json", import.meta.url), "utf8"),
+    ) as { messages: ReturnType<typeof messagesToCC> }
+
+    assert.deepEqual(messagesToCC(session.messages), expected.messages)
   })
 
   it("synthesizes missing results for orphaned tool calls", () => {
@@ -1003,6 +1026,151 @@ describe("messagesToCC()", () => {
       String(objectAt(result, ["2", "content", "0", "output", "value"])),
       /did not complete/,
     )
+  })
+
+  it("shortens compound tool-call ids to the generate wire limit without breaking pairs", () => {
+    const compound = `call_${"a".repeat(32)}|fc_${"b".repeat(32)}`
+    assert.equal(compound.length, 73)
+
+    const result = messagesToCC([
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: compound, name: "bash", arguments: { command: "ls" } }],
+      },
+      {
+        role: "toolResult",
+        toolCallId: compound,
+        toolName: "bash",
+        content: [{ type: "text", text: "ok" }],
+      },
+    ])
+
+    const wireCall = objectAt(result, ["0", "content", "0", "toolCallId"])
+    assert.equal(typeof wireCall, "string")
+    assert.ok((wireCall as string).length <= 64)
+    assert.notEqual(wireCall, compound)
+    assert.equal(objectAt(result, ["1", "content", "0", "toolCallId"]), wireCall)
+  })
+
+  it("leaves short tool-call ids unchanged", () => {
+    const result = messagesToCC([
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "c1", name: "bash", arguments: {} }],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "c1",
+        toolName: "bash",
+        content: [{ type: "text", text: "ok" }],
+      },
+    ])
+
+    assert.equal(objectAt(result, ["0", "content", "0", "toolCallId"]), "c1")
+    assert.equal(objectAt(result, ["1", "content", "0", "toolCallId"]), "c1")
+  })
+
+  for (const longFirst of [true, false]) {
+    it(`preserves a colliding short id when the ${longFirst ? "long" : "short"} id comes first`, () => {
+      const longId = `call_${"a".repeat(32)}|fc_${"b".repeat(32)}`
+      const standalone = messagesToCC([
+        {
+          role: "assistant",
+          content: [{ type: "toolCall", id: longId, name: "bash", arguments: {} }],
+        },
+      ])
+      const shortId = String(objectAt(standalone, ["0", "content", "0", "toolCallId"]))
+      assert.equal(shortId.length, 64)
+      const ids = longFirst ? [longId, shortId] : [shortId, longId]
+      const result = messagesToCC([
+        {
+          role: "assistant",
+          content: ids.map((id) => ({ type: "toolCall", id, name: "bash", arguments: {} })),
+        },
+        ...ids.map((id) => ({
+          role: "toolResult",
+          toolCallId: id,
+          toolName: "bash",
+          content: [{ type: "text", text: "ok" }],
+        })),
+      ])
+
+      const wireIds = ids.map((_, index) =>
+        String(objectAt(result, ["0", "content", String(index), "toolCallId"])),
+      )
+      assert.equal(wireIds[ids.indexOf(shortId)], shortId)
+      assert.equal(new Set(wireIds).size, ids.length)
+      for (const [index, wireId] of wireIds.entries()) {
+        assert.ok(wireId.length <= 64)
+        assert.equal(objectAt(result, [String(index + 1), "content", "0", "toolCallId"]), wireId)
+      }
+    })
+  }
+
+  it("keeps distinct overlong tool-call ids distinct on the generate wire", () => {
+    const first = `call_${"a".repeat(32)}|fc_${"b".repeat(32)}`
+    const second = `call_${"a".repeat(31)}c|fc_${"b".repeat(32)}`
+    const result = messagesToCC([
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: first, name: "bash", arguments: {} },
+          { type: "toolCall", id: second, name: "bash", arguments: {} },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolCallId: first,
+        toolName: "bash",
+        content: [{ type: "text", text: "one" }],
+      },
+      {
+        role: "toolResult",
+        toolCallId: second,
+        toolName: "bash",
+        content: [{ type: "text", text: "two" }],
+      },
+    ])
+
+    const wireFirst = objectAt(result, ["0", "content", "0", "toolCallId"])
+    const wireSecond = objectAt(result, ["0", "content", "1", "toolCallId"])
+    assert.ok((wireFirst as string).length <= 64)
+    assert.ok((wireSecond as string).length <= 64)
+    assert.notEqual(wireFirst, wireSecond)
+    assert.equal(objectAt(result, ["1", "content", "0", "toolCallId"]), wireFirst)
+    assert.equal(objectAt(result, ["2", "content", "0", "toolCallId"]), wireSecond)
+  })
+
+  it("maps synthesized missing results with the shortened tool-call id", () => {
+    const compound = `call_${"a".repeat(32)}|fc_${"b".repeat(32)}`
+    const result = messagesToCC([
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: compound, name: "edit", arguments: { path: "x" } }],
+      },
+    ])
+
+    const wireCall = objectAt(result, ["0", "content", "0", "toolCallId"])
+    assert.ok((wireCall as string).length <= 64)
+    assert.equal(objectAt(result, ["1", "content", "0", "toolCallId"]), wireCall)
+  })
+
+  it("shortens the same tool-call id deterministically", () => {
+    const compound = `call_${"a".repeat(32)}|fc_${"b".repeat(32)}`
+    const messages: MessageLike[] = [
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: compound, name: "bash", arguments: {} }],
+      },
+      {
+        role: "toolResult",
+        toolCallId: compound,
+        toolName: "bash",
+        content: [{ type: "text", text: "ok" }],
+      },
+    ]
+
+    assert.deepEqual(messagesToCC(messages), messagesToCC(messages))
   })
 
   it("handles empty conversations", () => {
